@@ -11,8 +11,9 @@ output:
     toc: true
     toc_depth: 3
     toc_float: true
-subtitle: Causal Decision Analysis under a Capacity Constraint
+subtitle: "Causal Decision Analysis under a Capacity Constraint (figures: c7e2d24+)"
 ---
+
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(
@@ -902,11 +903,11 @@ dec_final |>
   theme(panel.grid.minor = element_blank(), legend.position = "bottom")
 
 # Posterior-style density: transparent turquoise fill, no outline.
-col_ppos <- "#40b8b0"
+col_ppos <- "#2ec4b6"
 dec_final |>
   filter(decision == 1) |>
   ggplot(aes(p_positive_ev)) +
-  geom_density(fill = col_ppos, colour = NA, alpha = 0.22) +
+  geom_density(fill = alpha(col_ppos, 0.35), colour = NA, linewidth = 0) +
   labs(
     x = expression(P(EV > 0 ~ "|" ~ data)),
     y = "Density",
