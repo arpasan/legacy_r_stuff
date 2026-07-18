@@ -1,0 +1,9 @@
+.DS_Store
+**/.Rhistory
+**/.RData
+**/_cache/
+**/*_cache/
+**/*_files/
+projects/**/outputs/*.csv
+!projects/**/outputs/.gitkeep
+!projects/**/outputs/decisions_arpas_legacy.csv

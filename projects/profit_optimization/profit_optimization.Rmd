@@ -1,0 +1,578 @@
+---
+title: "Profit Optimization"
+author: "Andrej Arpáš"
+date: "2026-07-17"
+output:
+  html_document:
+    code_folding: show
+    fig_caption: true
+    highlight: tango
+    theme: yeti
+    toc: true
+    toc_depth: 3
+    toc_float: true
+subtitle: Ensemble Models and Bayesian Workflow
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  comment = NA,
+  fig.align = "center",
+  cache = FALSE
+)
+
+library(tidyverse)
+library(tidymodels)
+library(caret)
+library(corrplot)
+library(RColorBrewer)
+library(gridExtra)
+library(rstanarm)
+library(bayesplot)
+library(vip)
+
+tidymodels_prefer()
+options(mc.cores = max(1L, parallel::detectCores() - 1L))
+set.seed(42)
+
+data_dir <- "data"
+out_dir <- "outputs"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+contact_cost <- 5
+clv_gain <- 100
+capacity_frac <- 0.25
+```
+
+# Problem Setup
+
+Imagine you're optimizing (maximizing) for profit of some small business. The business has corporate clients (other corporate entities) and you have to decide which are to be targeted in a marketing campaign, the result of which should be a purchase decision on the part of the client. You target them by making a phone call but your call center can only handle calling 1/4 of the client base max. You have two datasets. One with the client base, and one called the pilot (which contains but a subset of the clients). Both contain 20 variables; the former requires making a recommendation (1 or 0) as to whom to target for the purchase, the latter also includes the purchase decisions and provides information about which clients, included in the pilot, were in the treatment group. Other than that, you know nothing about the variables.
+
+Economically, contacting a client costs `r contact_cost` and a purchase yields incremental discounted CLV of `r clv_gain`, so expected profit for contacting client $i$ is approximately
+
+$$
+\mathbb{E}[\mathrm{profit}_i] = `r clv_gain` \cdot P(\mathrm{purchase}_i \mid \mathrm{contact}) - `r contact_cost`.
+$$
+
+Because untreated clients in the pilot still purchase at a non-trivial rate, ranking solely by unconditional $P(\mathrm{purchase})$ can waste capacity on clients who would buy anyway. The cleaner targeting score is therefore either (i) $P(\mathrm{purchase} \mid \mathrm{contact}=1)$, or (ii) an uplift score $P(Y\mid T=1,X) - P(Y\mid T=0,X)$. We compare classical ML ensembles against a simple Bayesian logistic model, then allocate the call-center capacity (at most one quarter of the customer base) to the highest expected-profit scores.
+
+One way to proceed is to use the pilot data as training and the client base data as the deployment set. I'll run a number of machine learning models, which, considering we know nothing about the variables, I don't expect to perform all that well, comparing that approach to a simple Bayesian model in terms of their predictive accuracy and efficacy of making recommendations about which clients to target. The Bayesian model will give us a posterior to work with to gauge the probabilities with which a client would make a purchase decision, which is what we will optimize for.
+
+Okay, what we can do, to start off with, is to run some models to figure out what the variables (vars) were that turned out predictive of a purchase decision based on the pilot.
+
+The idea being that optimizing/maximizing for those vars that perform best would yield us the best candidates for modelling on the remainder of the customer base. (Provided that the sample in `pilot.csv` is representative and statistically sound otherwise, which is one assumption here. If so, we can use it to make inferences about the whole lot.)
+
+## Data
+
+A glance at what we're dealing with.
+
+```{r load-data}
+pilot_path <- file.path(data_dir, "pilot.csv")
+base_path <- file.path(data_dir, "CustomerBase.csv")
+
+pilot <- readr::read_csv(pilot_path, show_col_types = FALSE) |>
+  mutate(
+    across(c(V2, V19), as.factor),
+    treatment = as.integer(treatment),
+    purchase = as.integer(purchase)
+  )
+
+customer_base <- readr::read_csv(base_path, show_col_types = FALSE) |>
+  mutate(across(c(V2, V19), as.factor))
+
+# Align factor levels with the pilot (deployment set must share levels).
+for (col in c("V2", "V19")) {
+  levels(customer_base[[col]]) <- union(levels(pilot[[col]]), levels(customer_base[[col]]))
+  customer_base[[col]] <- factor(customer_base[[col]], levels = levels(pilot[[col]]))
+}
+
+n_base <- nrow(customer_base)
+call_capacity <- floor(capacity_frac * n_base)
+
+pilot |>
+  filter(treatment == 1) |>
+  head() |>
+  as_tibble()
+```
+
+```{r treatment-purchase-summary}
+pilot |>
+  group_by(treatment) |>
+  summarise(
+    n = n(),
+    purchases = sum(purchase),
+    purchase_rate = mean(purchase),
+    .groups = "drop"
+  )
+```
+
+The control arm still purchases at roughly `r sprintf("%.1f%%", 100 * mean(pilot$purchase[pilot$treatment == 0]))`, vs. about `r sprintf("%.1f%%", 100 * mean(pilot$purchase[pilot$treatment == 1]))` when contacted. The treatment effect is therefore modest in the raw averages; any propensity model that ignores that fact is solving a slightly different problem than profit-maximizing targeting.
+
+```{r split-pilot}
+set.seed(42)
+
+# Model the response among contacted clients for classical ML comparisons.
+treated <- pilot |> filter(treatment == 1)
+
+split_obj <- initial_split(treated, prop = 0.8, strata = purchase)
+training <- training(split_obj)
+testing <- testing(split_obj)
+
+# Full pilot (with treatment) for uplift / Bayesian work.
+pilot_model <- pilot |>
+  mutate(purchase_f = factor(purchase, levels = c(0, 1), labels = c("no", "yes")))
+```
+
+## EDA
+
+We can attempt some visualizations but since we don't know what the vars represent, there isn't much to discern patterns-wise.
+
+```{r eda-corr}
+num_cols <- pilot |>
+  select(where(is.numeric), -treatment) |>
+  names()
+
+corr <- cor(pilot[, num_cols], use = "pairwise.complete.obs")
+corrplot(
+  round(corr, 3),
+  method = "square",
+  type = "upper",
+  tl.col = "black",
+  order = "hclust",
+  col = brewer.pal(n = 5, name = "RdBu")
+)
+```
+
+```{r eda-scatter}
+chart1 <- ggplot(training, aes(x = V15, y = V7, color = factor(purchase))) +
+  geom_point(alpha = 0.7) +
+  labs(color = "purchase")
+
+chart2 <- ggplot(training, aes(x = V15, y = V12, color = factor(purchase))) +
+  geom_point(alpha = 0.7) +
+  scale_y_log10() +
+  labs(color = "purchase")
+
+grid.arrange(chart1, chart2, ncol = 2)
+```
+
+We may do at least one ensemble model, so let's do some prep for that.
+
+```{r caret-tree}
+ctrl <- trainControl(method = "cv", number = 10)
+
+# Drop near-constant / non-numeric helpers for the caret rpart path.
+train_caret <- training |>
+  select(-treatment) |>
+  mutate(purchase = factor(purchase, levels = c(0, 1), labels = c("no", "yes")))
+
+test_caret <- testing |>
+  select(-treatment) |>
+  mutate(purchase = factor(purchase, levels = c(0, 1), labels = c("no", "yes")))
+
+out <- train(
+  purchase ~ .,
+  data = train_caret,
+  method = "rpart2",
+  tuneLength = 10,
+  trControl = ctrl
+)
+plot(out)
+```
+
+So predictably, there are diminishing returns in using all vars. 15 max. should suffice but ideally way fewer.
+
+```{r caret-tree-eval}
+plot(out$finalModel)
+text(out$finalModel, pretty = 0)
+
+y_hat <- predict(out, newdata = test_caret)
+defaultSummary(data.frame(obs = test_caret$purchase, pred = y_hat))
+```
+
+Virtually guaranteed to overfit in the training data, and underperform on the test data, by default; these results, however, seem pretty good on accuracy alone. That is mostly the base-rate effect: with sparse purchases, predicting "no" often looks strong. Confirming the hypothesis is the fact that performing tree pruning to hone in on "the best" parts of the original tree simply returns the root, so this seems already the most optimal tree under that criterion — which is a warning, not a victory.
+
+
+# Modelling
+
+Let's proceed to modelling and see if we can figure out what vars matter the most using some actual architectures. We can also do the modelling using `tidymodels`; it has a few extra wrinkles though, so let's do the `initial_split` the `tidymodels` way to avoid clashes.
+
+```{r tidy-split}
+set.seed(42)
+
+e <- treated |>
+  select(-treatment) |>
+  mutate(buybool = factor(purchase, levels = c(0, 1), labels = c("no", "yes"))) |>
+  select(-purchase)
+
+purchase_split <- initial_split(e, prop = 0.75, strata = buybool)
+purchase_train <- training(purchase_split)
+purchase_test <- testing(purchase_split)
+
+base_recipe <- recipe(buybool ~ ., data = purchase_train) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+tree_model <- decision_tree(mode = "classification", cost_complexity = 0.006) |>
+  set_engine("rpart")
+
+tree_wflow <- workflow() |>
+  add_model(tree_model) |>
+  add_recipe(base_recipe)
+```
+
+```{r tidy-tree-fit}
+tree_fit <- fit(tree_wflow, data = purchase_train)
+
+plot(tree_fit$fit$fit$fit)
+text(tree_fit$fit$fit$fit, pretty = 0)
+```
+
+Get a confusion matrix implied by the model in the test set.
+
+```{r tidy-tree-cm}
+bind_cols(
+  purchase = purchase_test$buybool,
+  predict(tree_fit, new_data = purchase_test)
+) |>
+  conf_mat(truth = purchase, estimate = .pred_class)
+```
+
+Nothing to write home about in terms of predictiveness so far but let's proceed somewhat cautiously.
+
+## Random Forests (RF)
+
+```{r rf-fit}
+rf_model <- rand_forest(trees = 1000) |>
+  set_engine("randomForest", importance = TRUE) |>
+  set_mode("classification")
+
+rf_wflow <- workflow() |>
+  add_model(rf_model) |>
+  add_recipe(base_recipe)
+
+cv <- vfold_cv(purchase_train, v = 5, strata = buybool)
+
+fit_rf <- fit_resamples(
+  rf_wflow,
+  cv,
+  metrics = metric_set(accuracy, roc_auc, sens, spec),
+  control = control_resamples(save_pred = TRUE)
+)
+
+collect_metrics(fit_rf)
+
+rf_fit <- fit(rf_wflow, data = purchase_train)
+
+bind_cols(
+  purchase = purchase_test$buybool,
+  predict(rf_fit, new_data = purchase_test)
+) |>
+  conf_mat(truth = purchase, estimate = .pred_class)
+
+vip(extract_fit_engine(rf_fit), aesthetics = list(fill = "#FF3366", alpha = 0.7)) +
+  theme_minimal()
+```
+
+The predictiveness is weak and the results confirm what the visualizations intimated all along, which is that these vars do not seem terribly predictive of the purchase decision — conditional on the model and the data, that is. Since we want an ensemble model, we grudgingly oblige but I'm not happy about this. That said, let's do Boosting, and see if we can do better.
+
+## Boosting
+
+We still try to minimize a classification loss, but boosting builds an additive sequence of weak learners on reweighted residuals rather than bagging independent trees.
+
+```{r boost-fit}
+boost_model <- boost_tree(trees = 500, learn_rate = 0.05, tree_depth = 4) |>
+  set_engine("xgboost") |>
+  set_mode("classification")
+
+boost_wflow <- workflow() |>
+  add_recipe(base_recipe) |>
+  add_model(boost_model)
+
+fit_boost <- fit_resamples(
+  boost_wflow,
+  cv,
+  metrics = metric_set(accuracy, roc_auc, sens, spec),
+  control = control_resamples(save_pred = TRUE)
+)
+
+collect_metrics(fit_boost)
+
+boost_fit <- fit(boost_wflow, data = purchase_train)
+
+bind_cols(
+  purchase = purchase_test$buybool,
+  predict(boost_fit, new_data = purchase_test)
+) |>
+  conf_mat(truth = purchase, estimate = .pred_class)
+
+vip(extract_fit_engine(boost_fit), aesthetics = list(fill = "#0099CC", alpha = 0.6)) +
+  theme_minimal()
+```
+
+While this is technically an improvement on ROC-AUC in many runs, hard classification at 0.5 remains pretty abysmal because of class imbalance. That said, we can finally move on to more interesting models.
+
+## Discriminant Analysis (DA)
+
+Nearest Shrunken Centroids and BART were explored in earlier drafts; they did not beat simpler discriminant analysis under the same treated-only split, so we keep the stronger classical baseline here.
+
+### Linear Discriminant Analysis (LDA)
+
+```{r lda-qda-prep}
+# LDA/QDA need stable within-class covariance; drop high-cardinality / near-constant
+# categoricals (V2, V19) and keep numeric predictors only.
+g <- treated |>
+  select(-treatment, -V2, -V19) |>
+  mutate(purchase = factor(purchase, levels = c(0, 1), labels = c("no", "yes")))
+
+nzv <- nearZeroVar(g)
+if (length(nzv) > 0) {
+  g <- g[, -nzv]
+}
+
+set.seed(42)
+g_split <- initial_split(g, prop = 0.75, strata = purchase)
+g_train <- training(g_split)
+g_test <- testing(g_split)
+```
+
+```{r lda-fit}
+LDA <- train(
+  purchase ~ .,
+  data = g_train,
+  method = "lda",
+  preProcess = c("center", "scale"),
+  trControl = trainControl(method = "none")
+)
+confusionMatrix(predict(LDA, newdata = g_test), reference = g_test$purchase)
+```
+
+### Quadratic Discriminant Analysis (QDA)
+
+```{r qda-fit}
+QDA <- train(
+  purchase ~ .,
+  data = g_train,
+  method = "qda",
+  preProcess = c("center", "scale"),
+  trControl = trainControl(method = "none")
+)
+confusionMatrix(predict(QDA, newdata = g_test), reference = g_test$purchase)
+```
+
+These are often among the best classical results so far. There is significant sparseness in the dataset on account of only about `r sprintf("%.0f%%", 100 * mean(treated$purchase))` purchase decisions among the treated in the pilot. That doesn't bode particularly well for models to learn on. Adding bells and whistles to fine-tune the QDA rarely shaves off more false negatives at a fixed 0.5 threshold. So we have our best classical performer for hard labels — but for targeting we care about ranking and expected profit, not the 0.5 cut.
+
+
+# Back to Purchases
+
+Let's use the best classical model to score the customer base, then compare against a Bayesian ranking rule that respects capacity.
+
+```{r qda-deploy}
+# Refit QDA on all treated pilot rows (same feature set as g).
+qda_features <- setdiff(names(g), "purchase")
+h <- customer_base |>
+  select(all_of(intersect(qda_features, names(customer_base))))
+
+# Ensure factor columns present in g exist in h with matching levels.
+for (col in names(h)) {
+  if (is.factor(g[[col]])) {
+    h[[col]] <- factor(as.character(h[[col]]), levels = levels(g[[col]]))
+  }
+}
+
+QDA_full <- train(
+  purchase ~ .,
+  data = g,
+  method = "qda",
+  preProcess = c("center", "scale"),
+  trControl = trainControl(method = "none")
+)
+
+qda_prob <- predict(QDA_full, newdata = h, type = "prob")[["yes"]]
+qda_pred <- as.integer(qda_prob >= 0.5)
+
+tibble(
+  source = c("treated_pilot", "customer_base_qda_0.5"),
+  purchase_rate = c(mean(treated$purchase), mean(qda_pred))
+)
+```
+
+Does this look reasonable? Matching the pilot purchase rate at a 0.5 threshold is *not* evidence that targeting is calibrated for profit — it mostly shows that the classifier's positive rate echoes the training prevalence. We assume that the pilot was properly randomized and that the sampling was representative of the lot. We further condition on the model and the rest of the data.
+
+Seeing the model expects only a few thousand hard positives at 0.5 while our call center capacity is 1/4 of the client base (`r format(call_capacity, big.mark = ",")`), we can call far more than the hard-positive set. Provided that we have already paid for the capacity/bandwidth, we might as well use it up to the point where expected incremental profit stays non-negative. If we have more candidates than spots, we rank by posterior (or model) probability and take the top `r format(call_capacity, big.mark = ",")`. Honestly, our output suggests that machine learning (ML) doesn't really promote thinking if one stops at accuracy. It's useful, but what you really want is to understand your variables, do some proper modelling, ideally Bayesian, and perform statistical data analysis on your variables to prune them and in order to make hypotheses. You can in fact do everything purely Bayesian and have better decisions. Which is exactly what I'm going to show you next. We know nothing about our variables though, so it won't be as effective as it should but my guess is that it will still decide more coherently than hard-threshold ML. Okay, so next up, Bayes.
+
+## `stan_glm`
+
+One of the simpler models that is well suited to classification tasks.
+
+```{r bayes-setup}
+set.seed(42)
+
+# Two-model uplift on the full pilot: P(Y|T=1,X) and P(Y|T=0,X).
+feature_cols <- c(
+  "V1", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "V10", "V11",
+  "V12", "V13", "V14", "V15", "V16", "V17", "V18", "V20"
+)
+
+df_t1 <- pilot |>
+  filter(treatment == 1) |>
+  select(purchase, all_of(feature_cols))
+
+df_t0 <- pilot |>
+  filter(treatment == 0) |>
+  select(purchase, all_of(feature_cols))
+
+corrplot(cor(df_t1), tl.cex = 0.7)
+```
+
+```{r stan-fits}
+t_prior <- student_t(df = 7, location = 0, scale = 2.5)
+
+fit_t1 <- stan_glm(
+  purchase ~ .,
+  data = df_t1,
+  family = binomial(link = "logit"),
+  prior = t_prior,
+  prior_intercept = t_prior,
+  QR = TRUE,
+  chains = 4,
+  iter = 2000,
+  refresh = 0,
+  seed = 42
+)
+
+fit_t0 <- stan_glm(
+  purchase ~ .,
+  data = df_t0,
+  family = binomial(link = "logit"),
+  prior = t_prior,
+  prior_intercept = t_prior,
+  QR = TRUE,
+  chains = 4,
+  iter = 2000,
+  refresh = 0,
+  seed = 42
+)
+```
+
+```{r stan-summary}
+print(summary(fit_t1, probs = c(0.05, 0.95)), digits = 2)
+```
+
+### Diagnostics
+
+```{r stan-diagnostics}
+plot(fit_t1, pars = feature_cols[1:8])
+
+mcmc_rhat(rhat(fit_t1)) + yaxis_text(hjust = 1)
+
+loo_t1 <- loo(fit_t1, save_psis = TRUE, k_threshold = 0.7)
+print(loo_t1)
+```
+
+We can note that $\hat{R}$ is close to 1 (< 1.01), meaning the Markov chains are in close agreement with one another. So this looks good. The PSIS-LOO result is reliable enough when Pareto $k$ estimates stay below 0.7.
+
+```{r stan-in-sample}
+pred_t1 <- posterior_epred(fit_t1)
+p_hat <- colMeans(pred_t1)
+y_hat_class <- as.integer(p_hat >= 0.5)
+y_true <- df_t1$purchase
+
+acc <- mean(y_hat_class == y_true)
+sens <- mean(y_hat_class[y_true == 1] == 1)
+spec <- mean(y_hat_class[y_true == 0] == 0)
+
+tibble(
+  accuracy = acc,
+  sensitivity = sens,
+  specificity = spec,
+  n = length(y_true)
+)
+
+caret::confusionMatrix(
+  factor(y_hat_class, levels = c(0, 1), labels = c("no", "yes")),
+  factor(y_true, levels = c(0, 1), labels = c("no", "yes"))
+)
+```
+
+Do note that (i), off the bat, the simplest Bayesian model is at least competitive with the ML stack on the treated sample, and (ii) hard 0.5 classification is still the wrong operating point for a capacity-constrained campaign. Therefore, let's use posterior predictive means to *rank* the overall customer base instead.
+
+```{r stan-score-base}
+# Score the deployment set with both arms; uplift = p1 - p0.
+newdata_base <- customer_base |>
+  select(all_of(feature_cols))
+
+# Use posterior expectation of probability (faster and stabler than Bernoulli draws).
+p1 <- colMeans(posterior_epred(fit_t1, newdata = newdata_base, draws = 1000))
+p0 <- colMeans(posterior_epred(fit_t0, newdata = newdata_base, draws = 1000))
+
+uplift <- p1 - p0
+expected_profit <- clv_gain * uplift - contact_cost
+
+score_tbl <- tibble(
+  company_id = seq_len(n_base),
+  p_contact = p1,
+  p_control = p0,
+  uplift = uplift,
+  expected_profit = expected_profit
+)
+
+# Rank by expected incremental profit; fill capacity only while EV stays positive when possible.
+ranked <- score_tbl |>
+  arrange(desc(expected_profit), desc(p_contact)) |>
+  mutate(rank = row_number())
+
+n_positive_ev <- sum(ranked$expected_profit > 0)
+n_target <- min(call_capacity, max(n_positive_ev, 0L))
+if (n_target == 0L) {
+  # Fallback: if no positive-EV rows under the uplift model, use top capacity by p_contact.
+  n_target <- call_capacity
+  ranked <- score_tbl |>
+    arrange(desc(p_contact)) |>
+    mutate(rank = row_number())
+}
+
+dec_final <- ranked |>
+  mutate(decision = as.integer(rank <= n_target)) |>
+  arrange(company_id) |>
+  transmute(
+    decision,
+    company_name = company_id,
+    prob = p_contact,
+    uplift,
+    expected_profit
+  )
+
+dec_final |>
+  head(15) |>
+  as_tibble()
+
+c(
+  n_base = n_base,
+  call_capacity = call_capacity,
+  n_positive_ev = n_positive_ev,
+  n_targeted = sum(dec_final$decision),
+  mean_p_contact_targeted = mean(dec_final$prob[dec_final$decision == 1]),
+  mean_uplift_targeted = mean(dec_final$uplift[dec_final$decision == 1])
+)
+```
+
+```{r write-decisions}
+out_path <- file.path(out_dir, format(Sys.Date(), "%Y%m%d_stan_uplift_profit.csv"))
+readr::write_csv(dec_final |> select(decision), out_path)
+readr::write_csv(dec_final, file.path(out_dir, "decisions_arpas.csv"))
+out_path
+```
+
+So, if we want to do this "old school", and specify a 0.5 probability threshold, we generate a binary outcome, purchase / no purchase, but that doesn't necessarily make a whole lot of sense for a capacity-constrained call center. Furthermore, doing so gives us far fewer "buys" than the `r format(call_capacity, big.mark = ",")` slots we can fill. Indeed, we do Bayes because we want to avail ourselves of the power of posterior distributions and the probabilistic nature of the models. Therefore, what we do is look at posterior mean probabilities (and the implied uplift / expected profit), order them from highest to smallest, and identify up to `r format(call_capacity, big.mark = ",")` of the highest ones in descending order — stopping earlier if expected incremental profit turns negative.
+
+
+# Conclusion and Final Output
+
+What we have is a data frame with the clients in the original customer-base order, with the recommended decision, the contact-response probability, the estimated uplift, and expected incremental profit adjacent, conditional on the data and the two-arm Bayesian model. Compared with hard-threshold ML, this is a much better approach for the actual profit objective: it uses the randomized pilot as an A/B design, targets on incremental lift rather than raw propensity alone, and respects the call-center capacity constraint.
+
+If more time were available, natural extensions would include interaction-aware uplift forests, explicit cost-sensitive thresholds tuned on a held-out pilot fold, and hierarchical shrinkage across sparse categorical levels (e.g. `V19`).

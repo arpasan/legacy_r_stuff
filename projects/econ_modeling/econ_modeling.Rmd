@@ -1,0 +1,499 @@
+---
+title: "Economic Modeling"
+author: "Andrej Arpáš"
+date: "2026-07-17"
+output:
+  html_document:
+    code_folding: show
+    fig_caption: true
+    highlight: tango
+    theme: yeti
+    toc: true
+    toc_depth: 3
+    toc_float: true
+subtitle: Are Trade Deficits Bad?
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  comment = NA,
+  fig.align = "center"
+)
+
+library(tidyverse)
+library(VGAM)
+library(data.table)
+library(gridExtra)
+library(forecast)
+library(randomForest)
+library(caret)
+library(stargazer)
+
+set.seed(12152019)
+data_dir <- "data"
+```
+
+# Introduction
+
+This project aims at applying sound quantitative methods and data analytics in the realm of computational and mathematical statistics to economic output and the trade deficit and the extent to which it can or cannot be said that the latter is "bad" for the former.
+
+Running a trade deficit is what happens when a country imports more than it exports. The converse of that is referred to as a surplus. Both phenomena are forms of a lopsided trade balance, somewhat broader measure of which is the current account. Standard economic theory is unambiguous that the trade deficit is something not to be worried about. This, however, does not appear to be how the trade deficit tends to be perceived by the general public or written about in many a media outlet. The objective of this paper, therefore, is to analyze those metrics that, in one form or another, pertain to the trade deficit, such as I(M)ports, E(X)ports, the Trade Deficit (X-M), GDP data to gauge economic output, and the unemployment rate for the past ten years, from 2008 to 2018. (The data is quarterly and therefore 2019 could not be taken into account seeing that the last quarter had not been reported yet.)
+
+## Research Question: "Are Trade Deficits Bad?"
+
+The research question harkens back to the "infamous" economic identity $Y = G + I + C + NX$, where $Y$ denotes output, $G$ government spending, $I$ private investment, $C$ consumer spending, and $NX$ stands for net exports or the difference between exports and imports. It is this last term of the identity that seems to make some believe that since one takes away imports in order to arrive at the $Y$ figure, imports must be bad for the economy. This, however, is merely a book-keeping operation intended to ensure that the final figure not be overestimated. The subtracting is necessary lest imports are double-counted in all the other terms. (Imports are part of certain exports, the consumer spending, investments by companies and domestic manufacturers, and even government procurement allows for foreign-sourced components and so on.) Posing the question in such simplistic terms allows one to arrive at a falsifiable hypothesis and makes modelling more interesting.
+
+## Hypothesis & Methods
+
+I shall begin by presuming the trade deficit is indeed bad for the economy. What does "bad" mean in this context? "Bad" will be defined by the data to hold up the following relationship: The greater the trade deficit, the lower the output and vice versa.
+
+(As a corollary, I will also be tracking unemployment rates over the same time span since unemployment seems to be frequently lumped together with lower economic output, i.e. as yet another victim of the oft-vilified trade deficit. However, since the two are indeed paired up in economic literature, unemployment is largely redundant as a measurement tool in order to study the relationship between the trade deficit and economic output since the output and unemployment could be considered almost complements of sorts in the sense that there might be overlaps in terms of what one may learn about the trade deficit by observing either of the two.)
+
+For the purposes of this paper, output is the dependent variable, and it depends on independent variables in my models, such as the trade deficit, unemployment rates and so forth.
+
+The metrics of interest will be estimates of the extent to which GDP/output is predicated on the trade deficit. Statistically significant findings ($\alpha < 0.05$) of a positive association between the trade deficit and the GDP will be taken as indicative of the rejection of the null, and therefore a proof by contradiction that the trade deficit is actually "good" for the economy, i.e. conducive to economic growth.
+
+Caveat worth keeping in mind throughout: both GDP and the trade-deficit magnitude trend over 2008–2018. Associational models on levels can therefore pick up shared time trends rather than a structural causal effect. The exercise remains useful as a descriptive / falsification-style check against the folk claim that deficits mechanically depress output.
+
+In the Random Forests (RF) phase of my experiment, the output will be my estimand, estimated by my RF model (the estimator), and the predictions yielded by this model will be my estimates.
+
+
+# Data Description
+
+The data comes from three primary sources. All data in this project describes the United States economy and comes from U.S. sources only.
+
+## GDP
+
+Obtained from the Bureau of Economic Analysis (BEA), the data pertains to the Real Gross Domestic Product, in chained (2012) dollars, seasonally adjusted at annual rates, raw and converted in billions. (2008-2018, quarterly.)
+
+## Imports/Exports
+
+Source of this data is the United States International Trade Commission (USITC), Imports for Consumption, i.e. imports physically cleared through Customs (in Customs value), and Domestic Exports (FAS value - i.e. a measure of the total value), i.e. of U.S. or foreign origin if the latter have been significantly enhanced in value in the U.S. so as to be considered "domestic". The data comes raw, parsed at the 2-digit level (HTS-2) and is downloaded as aggregate and subsequently converted to get billions. The USITC web interface displays the data as monthly and quarterly values are obtained by adding up the months.
+
+## Unemployment Rate
+
+This data is reported monthly, in percent terms. Quarterly data is calculated using a mean of the monthly values. It is publicly accessible from the Bureau of Labor Statistics (BLS) website.
+
+
+# Data Analysis/Modelling
+
+Let's begin by loading the data...
+
+```{r load-clean}
+raw <- readr::read_csv(file.path(data_dir, "agg_d.csv"), show_col_types = FALSE)
+
+# Wide file: first column is metric name; remaining columns are quarters.
+metric <- raw[[1]]
+mat <- as.matrix(raw[, -1])
+rownames(mat) <- metric
+e <- as.data.frame(t(mat), stringsAsFactors = FALSE)
+e <- e |>
+  mutate(across(everything(), as.numeric)) |>
+  rownames_to_column("Quarters")
+
+# Boolean trade deficit and magnitude.
+e <- e |>
+  mutate(
+    TradeDeficit = as.integer(Exports_Q - Imports_Q < 0),
+    TradeDeficit_Size = abs(Exports_Q - Imports_Q),
+    GDP_Bn = Gdp_bn,
+    UnemploymentRate_Q = Ur_Q,
+    TradeDeficit_Size_Bn = TradeDeficit_Size / 1e9,
+    Imports_Bn = Imports_Q / 1e9,
+    UnemploymentRate_Numeric = UnemploymentRate_Q / 100
+  )
+
+str(e)
+```
+
+Okay, now we're ready to do some computation. We're almost done pre-processing. We've got columns: GDP ($ Billions), Imports, Exports, Unemployment Rate. All quarterly for ten years from 2008 to 2018.
+
+Now, I may want to do a Boolean on whether there is a trade deficit (1) or not (0). Plus, let's make another column and call it the TBalance to stand for the Balance-of-Trade, positive would mean Trade Surplus, and negative values would denote the sought after Trade Deficit.
+
+Running this operator and checking the df (data frame), one sees that the U.S. has had a continuous trade deficit for the entire observed period. Having thus confirmed what one might already have suspected, that is, that the U.S. has run a trade deficit the whole time, it makes more sense to create another vector which won't be the Balance-of-Trade, but instead we shall hone in on the Trade Deficit. Specifically, its quantity/magnitude, i.e. I will be looking at the absolute value of the Trade Deficit. We shall call this column `TradeDeficit_Size`. (Let's remind ourselves that the units are what they were for Exports/Imports, i.e. just $US.)
+
+Okay, we're ready to do a summary:
+
+```{r summary-tables}
+summary(e$TradeDeficit_Size)
+summary(e |> select(GDP_Bn, Imports_Q, Exports_Q, UnemploymentRate_Q, TradeDeficit_Size_Bn))
+as_tibble(e)
+```
+
+To just work with USD billions... (Might be easier to work with. It also lines up better with the GDP data, which is in billions.)
+
+Let's visualize what we're dealing with:
+
+```{r first-glance}
+mid <- median(e$Imports_Bn)
+
+first_glance <- ggplot(e) +
+  geom_point(
+    aes(
+      x = TradeDeficit_Size_Bn,
+      y = GDP_Bn / 1000,
+      color = Imports_Bn,
+      size = UnemploymentRate_Q
+    ),
+    shape = 17,
+    alpha = 0.85
+  ) +
+  scale_color_gradient2(
+    midpoint = mid,
+    low = "white",
+    mid = "paleturquoise3",
+    high = "midnightblue",
+    space = "Lab"
+  ) +
+  geom_smooth(
+    aes(x = TradeDeficit_Size_Bn, y = GDP_Bn / 1000),
+    colour = "thistle1",
+    se = FALSE,
+    method = "loess",
+    formula = y ~ x
+  ) +
+  labs(
+    title = expression(" "*italic("Good for the Economy, Good for Jobs")*" a.k.a"),
+    subtitle = "Trade Deficit VS GDP & Unemployment, 2008-2018",
+    x = "Trade Deficit (in 1e9 Dollars)",
+    y = "GDP (in 1e12 Dollars)",
+    size = "Unemployment Rate (%)",
+    colour = "Imports ($ Billions)"
+  ) +
+  theme(
+    plot.title = element_text(size = 10.5),
+    plot.subtitle = element_text(size = 10.5)
+  )
+
+first_glance
+```
+
+This is informative. We do see, and begin to suspect, that the trade deficit may not be such a bad thing after all. Looking at this chart, I'm expecting those stat. signif. findings to start pouring in. Let's do a few models. Start with the simplest...
+
+
+## Phase #1: Simple OLS
+
+```{r lm1}
+lm1 <- lm(GDP_Bn ~ TradeDeficit_Size_Bn, data = e)
+summary(lm1)
+```
+
+Simple linear model tells me that, indeed, as expected, every additional billion dollars' increase in the trade deficit, leads to a large, statistically significant increase in the GDP. Indeed, we get a very small p-value. (Adjusted R-squared is substantial.) Again: shared trends can inflate this association.
+
+Now, let's do something a little more clever...
+
+```{r lm2}
+lm2 <- lm(GDP_Bn ~ (TradeDeficit_Size_Bn + Imports_Bn + UnemploymentRate_Q)^2, data = e)
+summary(lm2)
+```
+
+While this is nice, pair-wise interactions are a good thing just to get the sense of how the data behaves when jostled together, however, doing interactions among everything strains credulity. Try again...
+
+Let's try an interaction with the unemployment rate, while conditioning the unemployment to hover at about the full-employment level (threshold $\pm 1\%$), which in the U.S. is generally thought to be 5%...
+
+```{r lm4}
+# Replaces the former QMSS::near() helper.
+near_full_employment <- abs(e$UnemploymentRate_Numeric - 0.05) <= 1e-2
+lm4 <- lm(
+  GDP_Bn ~ TradeDeficit_Size_Bn:near_full_employment,
+  data = e
+)
+summary(lm4)
+```
+
+When the unemployment rate is within one percent of the full-employment level (i.e. 5%), for each additional billion dollar increase in the trade deficit, the GDP association remains positive and statistically significant. There does not appear to be much difference within vs. without the bounds, though.
+
+Seems like I'm using up too many degrees of freedom, i.e. the residual error term is inflated by having to estimate too many parameters, thus artificially causing the significance to plummet. (The parameter estimates oughtn't to change all that much.) Let's do fewer interactions and only where it makes sense. So, for instance...
+
+```{r lm7}
+lm7 <- lm(GDP_Bn ~ TradeDeficit_Size_Bn + UnemploymentRate_Q, data = e)
+summary(lm7)
+```
+
+Adjusted R-squared improves relative to `lm1`. With every one percent increase in the unemployment rate, net all else, the predicted GDP goes down substantially. Compared to `lm1`, this model's Adj. $R^2$ goes up while the Trade Deficit coefficient shrinks, though both remain statistically significant. What I should say here is that although accounting for the Unemployment Rate did help explain away more of my data, these results should be viewed through the prism of the so-called difference version of Okun's Law, which is a proven concept in standard economic theory that describes how quarterly changes in the unemployment rate move hand-in-hand with the growth in real output. (The GDP data I have is real output.) So, we already know there is this relationship, which allows us to surmise that though we have the Trade Deficit capture the $M$ part of the output identity $Y = G + I + C + (X-M)$, the unemployment may be capturing fragments of the other elements so adding it into the model is like mirroring the GDP, a little bit like using the GDP to predict the GDP, just obtusely. Plus, we may overestimate the trade portion of the identity since both the Trade Deficit and the Unemployment Rate may be drawing on similar factors for their predictiveness. For my other models, I think it best to steer clear of the Unemployment Rate.
+
+```{r stargazer-anova}
+stargazer(lm1, lm7, type = "text")
+anova(lm1, lm7)
+```
+
+Although running a partial F-test shows that the new variable improved the model fit, I still think it's a bad idea to include it.
+
+
+## Phase #2: Ordinal Logit Regression. Try that...
+
+In order to do so, I'll have to convert the GDP such that categories are ordered.
+
+```{r ordinal-prep}
+quintiles <- quantile(e$GDP_Bn, probs = seq(0, 1, 1 / 5), na.rm = TRUE)
+
+g <- e |>
+  mutate(
+    GDP_ByQuintiles = cut(
+      GDP_Bn,
+      breaks = quintiles,
+      include.lowest = TRUE,
+      labels = c("Lowest", "Low", "Moderate", "Higher", "High")
+    )
+  )
+
+ordinal.logit1 <- vglm(
+  GDP_ByQuintiles ~ TradeDeficit_Size_Bn,
+  data = g,
+  family = propodds
+)
+summary(ordinal.logit1)
+```
+
+```{r check-ordered}
+levels(ordered(g$GDP_ByQuintiles))
+```
+
+This is to check if $y$ is ordered. We get levels `Lowest < Low < Moderate < Higher < High`, which seems pretty ordered to me, so I think we can ignore the Warning message.
+
+Let's add odd-ratios to the output:
+
+```{r odds-ratios}
+coef.ol1 <- as.data.frame(coef(summary(ordinal.logit1)))
+coef.ol1[["Odd Ratio"]] <- exp(coef.ol1[["Estimate"]])
+coef.ol1
+```
+
+For each additional billion dollars in the Trade Deficit, the logit associated with going up one quintile in the GDP increases (stat. signif.), as opposed to a lower category, net of other factors. That is, the odds of the GDP going up one quintile, as opposed to a lower quintile, net of all else, increase by roughly $\mathrm{e}^{\hat\beta}-1$.
+
+Let's confirm the results running the regular Logit `glm` and making some adaptations.
+
+5 categories - 1 = 4 equations.
+
+```{r cumulative-logits}
+GDP_Q2thru5 <- g$GDP_ByQuintiles %in% c("Low", "Moderate", "Higher", "High")
+GDP_Q3thru5 <- g$GDP_ByQuintiles %in% c("Moderate", "Higher", "High")
+GDP_Q4Q5 <- g$GDP_ByQuintiles %in% c("Higher", "High")
+GDP_Q5 <- g$GDP_ByQuintiles == "High" # was incorrectly "Highest" in the legacy draft
+
+logit.2345_vs_1 <- glm(GDP_Q2thru5 ~ TradeDeficit_Size_Bn, data = g, family = binomial)
+logit.345_vs_12 <- glm(GDP_Q3thru5 ~ TradeDeficit_Size_Bn, data = g, family = binomial)
+logit.45_vs_123 <- glm(GDP_Q4Q5 ~ TradeDeficit_Size_Bn, data = g, family = binomial)
+logit.5_vs_1234 <- glm(GDP_Q5 ~ TradeDeficit_Size_Bn, data = g, family = binomial)
+
+coef.table <- cbind(
+  "Logit (2,3,4,5 vs. 1)" = coef(logit.2345_vs_1)[-1],
+  "Logit (3,4,5 vs. 1,2)" = coef(logit.345_vs_12)[-1],
+  "Logit (4,5 vs. 1,2,3)" = coef(logit.45_vs_123)[-1],
+  "Logit (5 vs. 1,2,3,4)" = coef(logit.5_vs_1234)[-1],
+  "Ordinal Logit" = coef(ordinal.logit1)[names(coef(ordinal.logit1)) == "TradeDeficit_Size_Bn"]
+)
+
+print(coef.table, digits = 3)
+```
+
+Hooray, indeed the ordinal slope lines up with the cumulative logits for the shared slope under proportional odds — that is, with each additional billion dollars in the Trade Deficit, my logit of going up one quintile in the GDP, as opposed to a lower category, net all else, increases by the same order of magnitude (stat. signif.).
+
+
+## Phase #3: Panel Time Series
+
+One thing I haven't taken into account yet is that I do have panel data, i.e. really a time series. It's all just GDP, Trade Deficit etc., but different quarters. Let's input that as a separate column.
+
+```{r quarters-factor}
+e <- e |>
+  mutate(
+    Quarters = factor(Quarters, levels = unique(Quarters)),
+    Quarters_Num = as.integer(Quarters)
+  )
+levels(e$Quarters)
+```
+
+Now, we're ready!
+
+First, let's look at what the data looks like in terms of the time factor.
+
+```{r ts-charts}
+chart1 <- ggplot(e) +
+  geom_line(aes(x = Quarters, y = TradeDeficit_Size_Bn, group = 1), color = "seagreen1") +
+  labs(
+    title = "Time Series Chart #1",
+    subtitle = "Trade Deficit 2008~2018",
+    caption = "Source: USITC",
+    y = "$Bn"
+  ) +
+  theme(
+    panel.border = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.text = element_text(size = 6),
+    legend.position = "none",
+    plot.subtitle = element_text(face = "bold"),
+    axis.line = element_line(color = "black")
+  ) +
+  scale_x_discrete(
+    name = "YYYYQ#",
+    breaks = levels(e$Quarters)[c(TRUE, rep(FALSE, 3))]
+  )
+
+chart2 <- ggplot(e) +
+  geom_line(aes(x = Quarters, y = GDP_Bn / 1e3, group = 1), color = "violetred1") +
+  labs(
+    title = "Time Series Chart #2",
+    subtitle = "GDP 2008~2018",
+    caption = "Source: BEA",
+    y = "$Tn"
+  ) +
+  theme(
+    panel.border = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.text = element_text(size = 6),
+    legend.position = "none",
+    plot.subtitle = element_text(face = "bold"),
+    axis.line = element_line(color = "black")
+  ) +
+  scale_x_discrete(
+    name = "YYYYQ#",
+    breaks = levels(e$Quarters)[c(TRUE, rep(FALSE, 3))]
+  )
+
+chart3 <- ggplot(e) +
+  geom_line(aes(x = Quarters, y = UnemploymentRate_Q, group = 1), color = "peachpuff3") +
+  labs(
+    title = "Time Series Chart #3",
+    subtitle = "Unemployment Rate 2008~2018",
+    caption = "Source: BLS",
+    y = "Percent"
+  ) +
+  theme(
+    panel.border = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.text = element_text(size = 6),
+    legend.position = "none",
+    plot.subtitle = element_text(face = "bold"),
+    axis.line = element_line(color = "black")
+  ) +
+  scale_x_discrete(
+    name = "YYYYQ#",
+    breaks = levels(e$Quarters)[c(TRUE, rep(FALSE, 3))]
+  )
+
+grid.arrange(chart1, chart2, chart3)
+```
+
+Some more time series' charts might help better understand the data...
+
+```{r seasonal-plots}
+ts_quarters <- ts(
+  as.numeric(e$TradeDeficit_Size_Bn),
+  start = c(2008, 1),
+  end = c(2018, 4),
+  frequency = 4
+)
+
+ggseasonplot(x = ts_quarters, polar = TRUE) +
+  ylab("in 1e9 Dollars") +
+  ggtitle("Seasonal Plot #1: Trade Deficit")
+
+ggseasonplot(x = ts_quarters, year.labels = TRUE, year.labels.left = FALSE) +
+  ylab("in 1e9 Dollars") +
+  ggtitle("Seasonal Plot #2: Trade Deficit")
+```
+
+That's better in terms of understanding the seasonality of the trade deficit. So, we see the seasonal/annual patterns. I do however, for the purposes of this project, hone in on just one country (the U.S.), which would be my idnum in first differenced regression. It is therefore not necessary to do first differences. Instead of the First Differences then, let's do something predictive, like Random Forests with time data.
+
+### Random Forests & Predicting
+
+Creating time lags: using GDP in $Q_{n-1}$ to predict GDP in $Q_n$:
+
+```{r lags-rf}
+e <- e |>
+  arrange(Quarters_Num) |>
+  mutate(
+    GDP_Bn_Lag1 = lag(GDP_Bn, 1L),
+    TradeDeficit_Size_Bn_Lag1 = lag(TradeDeficit_Size_Bn, 1L),
+    UnemploymentRate_Q_Lag1 = lag(UnemploymentRate_Q, 1L)
+  )
+
+training <- e |> filter(Quarters_Num <= 33)
+testing <- e |> filter(Quarters_Num > 33)
+
+rf <- randomForest(
+  GDP_Bn ~ GDP_Bn_Lag1 + Quarters_Num + TradeDeficit_Size_Bn_Lag1 + UnemploymentRate_Q_Lag1,
+  data = training,
+  importance = TRUE,
+  ntree = 1000,
+  na.action = na.omit
+)
+```
+
+What's the most important predictor?
+
+```{r rf-importance}
+imp <- as.data.frame(sort(importance(rf)[, 1], decreasing = TRUE), optional = TRUE)
+names(imp) <- "% Inc. MSE"
+imp
+```
+
+So, there are two conclusions to make here. One is that indeed, since all the trade deficit, the GDP, and the unemployment rate in some quarter $n$ are, apparently, to a large extent predicated on what the values for these variables were in quarter $n-1$, i.e. the previous one. This is to be expected in a time series for data such as the one I have. The second takeaway is that the Unemployment Rate is again acting up as a reflector of some of the other GDP elements, thus this variable's predictiveness/importance may easily be overestimated by the model.
+
+```{r rf-ntree}
+which.min(rf$mse) # How many trees would suffice to get the smallest MSE?
+```
+
+Predict and evaluate on the testing set:
+
+```{r rf-eval}
+y_hat <- predict(rf, newdata = testing)
+defaultSummary(data.frame(obs = testing$GDP_Bn, pred = y_hat))
+
+h <- testing |>
+  transmute(
+    Quarters,
+    Quarters_Num,
+    GDP_Bn,
+    GDP_Bn_RF = y_hat
+  )
+h
+```
+
+RMSE is large in absolute billions, which is worrying for a levels forecast on a short univariate national series.
+
+Ideally, we would like a smaller RMSE, but that would necessitate more data from more countries and possibly some more variables to throw in the model and to be able to try new models, maybe first differencing.
+
+```{r rf-plot}
+chart4 <- ggplot(h) +
+  geom_line(aes(x = Quarters, y = GDP_Bn / 1e3, group = 1, linetype = "Actual"), color = "deeppink1") +
+  geom_line(aes(x = Quarters, y = GDP_Bn_RF / 1e3, group = 1, linetype = "Predicted"), color = "deeppink1") +
+  labs(
+    title = "Time Series Chart #4",
+    subtitle = "Predicted VS Actual GDP (holdout quarters)",
+    caption = "Source: BEA, Own Random Forests' Model",
+    y = "$Tn",
+    linetype = NULL
+  ) +
+  theme(
+    panel.background = element_blank(),
+    plot.subtitle = element_text(face = "bold"),
+    axis.line = element_line(color = "black"),
+    legend.key = element_blank()
+  ) +
+  scale_linetype_manual(values = c(Actual = "solid", Predicted = "dashed")) +
+  scale_x_discrete(
+    name = "YYYYQ#",
+    breaks = levels(e$Quarters)[c(TRUE, rep(FALSE, 3))]
+  )
+
+chart4
+```
+
+Performs subpar on account of having too few observations (quarterly GDP figures for only a number of years)... This needs a Bayesian approach to fix. The takeaway is that the best model given some of the confines turned out to be, arguably, my Ordinal Logit.
+
+
+# Findings/Conclusions
+
+I have found that the most sensible model to use for this analysis was an Ordinal Logit Regression, which delivered statistically significant results.
+
+According to this model, for each additional billion dollar increase in the Trade Deficit, the logit associated with going up one quintile in the GDP category increases (stat. signif.), as opposed to a lower category, net of other factors. That is, the odds of the GDP going up one quintile, as opposed to a lower quintile, net of all else, increase by $\mathrm{e}^{\hat\beta}-1$. This would indicate a positive *associational* relationship between the trade deficit and the output in these levels data. Further research is necessary to explore some other interactions, to iron out deficiencies in the panel time series predictivity of random forests given the nature of the present data, and to separate shared trends from structural effects (e.g. via differences or richer covariates). More countries would also have to be taken into account if generalizations were to be made. This, however, is a promising start.
