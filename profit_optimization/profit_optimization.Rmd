@@ -24,7 +24,7 @@ knitr::opts_chunk$set(
   fig.width = 7,
   fig.height = 4.2,
   dpi = 150,
-  cache = FALSE
+  cache = TRUE
 )
 
 library(tidyverse)
@@ -37,6 +37,7 @@ library(bayesplot)
 library(loo)
 library(pROC)
 library(scales)
+library(ggpattern)
 
 tidymodels_prefer()
 options(mc.cores = max(1L, parallel::detectCores() - 1L))
@@ -50,17 +51,44 @@ contact_cost <- 5
 clv_gain <- 100
 capacity_frac <- 0.25
 
-plot_importance <- function(imp_tbl, fill = "#2b6a8f") {
-  ggplot(imp_tbl, aes(x = importance, y = reorder(variable, importance))) +
-    geom_col(fill = fill, width = 0.55, colour = NA) +
-    labs(x = "Importance", y = NULL) +
-    theme_minimal(base_size = 12) +
+# Pastel palette for hatched bars / posterior curves.
+col_pastel_blue <- "#8eb6c8"
+col_pastel_terra <- "#d4a08c"
+col_pastel_slate <- "#9aa7b2"
+
+# Thin unfilled bars with stripe hatch; outline matches pattern colour.
+hatched_col <- function(width, colour) {
+  geom_col_pattern(
+    width = width,
+    fill = NA,
+    colour = colour,
+    linewidth = 0.55,
+    pattern = "stripe",
+    pattern_angle = 45,
+    pattern_colour = colour,
+    pattern_fill = NA,
+    pattern_density = 0.45,
+    pattern_spacing = 0.025,
+    pattern_key_scale_factor = 0.6
+  )
+}
+
+plot_theme_bars <- function(base_size = 11) {
+  theme_minimal(base_size = base_size) +
     theme(
       panel.grid.minor = element_blank(),
       panel.grid.major.y = element_blank(),
       axis.text.y = element_text(size = 10),
       plot.margin = margin(8, 12, 8, 8)
     )
+}
+
+# Half the previous importance bar width (was 0.55).
+plot_importance <- function(imp_tbl, colour = col_pastel_blue) {
+  ggplot(imp_tbl, aes(x = importance, y = reorder(variable, importance))) +
+    hatched_col(width = 0.275, colour = colour) +
+    labs(x = "Importance", y = NULL) +
+    plot_theme_bars(base_size = 12)
 }
 
 # Posterior expected incremental profit and P(EV > 0) from epred matrices.
@@ -249,7 +277,7 @@ rf_imp <- vip::vi(extract_fit_engine(rf_fit)) |>
   as_tibble() |>
   transmute(variable = Variable, importance = Importance) |>
   slice_max(importance, n = 10)
-plot_importance(rf_imp, fill = "#b85c38")
+plot_importance(rf_imp, colour = col_pastel_terra)
 
 boost_fit <- workflow() |>
   add_recipe(rec) |>
@@ -267,7 +295,7 @@ boost_imp <- vip::vi(extract_fit_engine(boost_fit)) |>
   as_tibble() |>
   transmute(variable = Variable, importance = Importance) |>
   slice_max(importance, n = 10)
-plot_importance(boost_imp, fill = "#2b6a8f")
+plot_importance(boost_imp, colour = col_pastel_blue)
 ```
 
 As expected under imbalance, 0.5-threshold ensembles are poor campaign rules. Importance plots are exploratory only.
@@ -443,23 +471,47 @@ cal_tbl <- tibble(p_hat = p_hat_train, y = y_obs) |>
     p_hat_mean = mean(p_hat),
     y_rate = mean(y),
     .groups = "drop"
+  ) |>
+  mutate(
+    se = sqrt(pmax(y_rate * (1 - y_rate) / n, 1e-12)),
+    lo = pmax(0, y_rate - 1.96 * se),
+    hi = pmin(1, y_rate + 1.96 * se),
+    # Stagger n labels so low-p deciles do not collide.
+    lab_x = p_hat_mean + 0.012 + 0.004 * (bin %% 2),
+    lab_y = y_rate + 0.018 + 0.006 * ((bin + 1) %% 2)
   )
 
+cal_lim <- max(cal_tbl$p_hat_mean, cal_tbl$hi, cal_tbl$lab_x, cal_tbl$lab_y) * 1.06
 ggplot(cal_tbl, aes(p_hat_mean, y_rate)) +
-  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
-  geom_point(aes(size = n), colour = "#2b6a8f", alpha = 0.9) +
-  geom_line(colour = "#2b6a8f", linewidth = 0.4) +
-  scale_size_area(max_size = 8) +
-  coord_equal(xlim = c(0, max(cal_tbl$p_hat_mean, cal_tbl$y_rate) * 1.05),
-              ylim = c(0, max(cal_tbl$p_hat_mean, cal_tbl$y_rate) * 1.05)) +
+  geom_abline(
+    slope = 1, intercept = 0, linetype = "22",
+    colour = "grey65", linewidth = 0.4
+  ) +
+  geom_linerange(
+    aes(ymin = lo, ymax = hi),
+    colour = col_pastel_blue, linewidth = 0.45, alpha = 0.9
+  ) +
+  geom_line(colour = col_pastel_blue, linewidth = 0.45, alpha = 0.75) +
+  geom_point(
+    shape = 21, fill = "white", colour = col_pastel_blue,
+    size = 2.3, stroke = 0.7
+  ) +
+  geom_text(
+    aes(x = lab_x, y = lab_y, label = n),
+    size = 2.4, colour = "grey45", family = "mono"
+  ) +
+  coord_equal(xlim = c(0, cal_lim), ylim = c(0, cal_lim), expand = FALSE) +
   labs(
     x = "Mean predicted P(purchase)",
     y = "Observed purchase rate",
-    size = "n",
-    title = "PPC / calibration: deciles of predicted probability"
+    title = "PPC / calibration: deciles of predicted probability",
+    subtitle = "Open points; whiskers ≈ 95% intervals; labels = bin n"
   ) +
   theme_minimal(base_size = 11) +
-  theme(panel.grid.minor = element_blank())
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.subtitle = element_text(size = 8.5, colour = "grey40")
+  )
 ```
 
 ```{r s-cate-eval}
@@ -604,16 +656,16 @@ policy_tbl |>
 ```
 
 ```{r policy-plot, fig.height=3.4}
+# One-third the previous policy bar width (was 0.55).
 policy_tbl |>
   ggplot(aes(ipw_value, reorder(policy, ipw_value))) +
-  geom_col(width = 0.55, fill = "#2b6a8f", colour = NA) +
+  hatched_col(width = 0.18, colour = col_pastel_blue) +
   labs(
     x = "IPW estimate of E[Y under policy] on held-out pilot",
     y = NULL,
     title = "Policy value comparison (higher is better)"
   ) +
-  theme_minimal(base_size = 11) +
-  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank())
+  plot_theme_bars(base_size = 11)
 ```
 
 # Capacity–profit curve
@@ -836,32 +888,54 @@ tibble(
 ```{r deploy-plots, fig.height=3.6}
 dec_final |>
   mutate(targeted = factor(decision, labels = c("not targeted", "targeted"))) |>
-  ggplot(aes(expected_profit, fill = targeted)) +
-  geom_histogram(bins = 60, alpha = 0.9, colour = NA) +
-  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
-  scale_fill_manual(values = c("not targeted" = "#bdbdbd", "targeted" = "#2b6a8f")) +
+  ggplot(aes(expected_profit, colour = targeted, fill = targeted)) +
+  geom_density(alpha = 0.12, linewidth = 0.55, key_glyph = "path") +
+  geom_vline(xintercept = 0, linetype = "22", colour = "grey45", linewidth = 0.4) +
+  scale_colour_manual(values = c(
+    "not targeted" = col_pastel_slate,
+    "targeted" = col_pastel_blue
+  )) +
+  scale_fill_manual(values = c(
+    "not targeted" = col_pastel_slate,
+    "targeted" = col_pastel_blue
+  )) +
   labs(
     x = "Posterior mean incremental profit if contacted",
-    y = "Customers",
+    y = "Density",
+    colour = NULL,
     fill = NULL,
     title = "Deployment scores (customer base)"
   ) +
   theme_minimal(base_size = 11) +
-  theme(panel.grid.minor = element_blank(), legend.position = "bottom")
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom"
+  )
 
+# Posterior-style density with stripe hatch (not a histogram).
 dec_final |>
   filter(decision == 1) |>
   ggplot(aes(p_positive_ev)) +
-  geom_histogram(bins = 40, fill = "#2b6a8f", colour = NA) +
+  geom_density_pattern(
+    pattern = "stripe",
+    fill = "white",
+    colour = col_pastel_blue,
+    linewidth = 0.65,
+    pattern_angle = 45,
+    pattern_colour = col_pastel_blue,
+    pattern_fill = "white",
+    pattern_density = 0.55,
+    pattern_spacing = 0.018,
+    pattern_alpha = 1
+  ) +
   labs(
     x = expression(P(EV > 0 ~ "|" ~ data)),
-    y = "Targeted customers",
+    y = "Density",
     title = "Posterior probability of positive incremental profit among targets"
   ) +
   theme_minimal(base_size = 11) +
   theme(panel.grid.minor = element_blank())
 ```
-
 ```{r write-decisions}
 readr::write_csv(dec_final |> select(decision), file.path(out_dir, "decisions_arpas.csv"))
 readr::write_csv(dec_final, file.path(out_dir, "decisions_arpas_detailed.csv"))
