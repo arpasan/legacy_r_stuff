@@ -4,7 +4,18 @@
 **/_cache/
 **/*_cache/
 **/*_files/
-projects/**/outputs/*.csv
-!projects/**/outputs/.gitkeep
-!projects/**/outputs/decisions_arpas_legacy.csv
 AGENTS.md
+
+# Default: ignore generated CSVs under outputs/
+**/outputs/*.csv
+!**/outputs/.gitkeep
+
+# Profit Optimization deliverables (ship with the remaster)
+!profit_optimization/outputs/decisions_arpas.csv
+!profit_optimization/outputs/decisions_arpas_detailed.csv
+!profit_optimization/outputs/decisions_arpas_legacy.csv
+!profit_optimization/outputs/heldout_policy_values.csv
+!profit_optimization/outputs/capacity_profit_curve.csv
+
+# Legacy path exception while Econ still lives under projects/
+!projects/**/outputs/decisions_arpas_legacy.csv

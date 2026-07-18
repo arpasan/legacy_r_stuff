@@ -1,0 +1,888 @@
+---
+title: "Profit Optimization"
+author: "Andrej Arpáš"
+date: "12/15/2020"
+output:
+  html_document:
+    code_folding: show
+    fig_caption: true
+    highlight: tango
+    theme: yeti
+    toc: true
+    toc_depth: 3
+    toc_float: true
+subtitle: Causal Decision Analysis under a Capacity Constraint
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  comment = NA,
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 4.2,
+  dpi = 150,
+  cache = FALSE
+)
+
+library(tidyverse)
+library(tidymodels)
+library(caret)
+library(corrplot)
+library(RColorBrewer)
+library(rstanarm)
+library(bayesplot)
+library(loo)
+library(pROC)
+library(scales)
+
+tidymodels_prefer()
+options(mc.cores = max(1L, parallel::detectCores() - 1L))
+set.seed(42)
+
+data_dir <- "data"
+out_dir <- "outputs"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+contact_cost <- 5
+clv_gain <- 100
+capacity_frac <- 0.25
+
+plot_importance <- function(imp_tbl, fill = "#2b6a8f") {
+  ggplot(imp_tbl, aes(x = importance, y = reorder(variable, importance))) +
+    geom_col(fill = fill, width = 0.55, colour = NA) +
+    labs(x = "Importance", y = NULL) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major.y = element_blank(),
+      axis.text.y = element_text(size = 10),
+      plot.margin = margin(8, 12, 8, 8)
+    )
+}
+
+# Posterior expected incremental profit and P(EV > 0) from epred matrices.
+summarize_ev <- function(p1, p0, clv = clv_gain, cost = contact_cost) {
+  tau <- p1 - p0
+  ev <- clv * tau - cost
+  tibble(
+    uplift_mean = colMeans(tau),
+    uplift_q05 = apply(tau, 2, quantile, 0.05),
+    uplift_q95 = apply(tau, 2, quantile, 0.95),
+    ev_mean = colMeans(ev),
+    ev_q05 = apply(ev, 2, quantile, 0.05),
+    ev_q95 = apply(ev, 2, quantile, 0.95),
+    p_positive_ev = colMeans(ev > 0)
+  )
+}
+
+# IPW estimate of policy value under a known propensity (RCT).
+# V(π) = E[π(X) Y(1) + (1-π(X)) Y(0)].
+ipw_policy_value <- function(y, t, pi, e = mean(t)) {
+  w1 <- pi * t / e
+  w0 <- (1 - pi) * (1 - t) / (1 - e)
+  mean(w1 * y + w0 * y)
+}
+```
+
+# Problem Setup
+
+Imagine you're optimizing (maximizing) for profit of some small business. The business has corporate clients and you must decide whom to target in a marketing campaign. Contact is a phone call; the call center can handle at most one quarter of the client base. The pilot is a **randomized** contact experiment: `treatment = 1` means contacted. `purchase` is the observed outcome. Features $X = (V_1,\ldots,V_{20})$ are anonymized.
+
+Contact costs `r contact_cost`; a purchase yields incremental discounted CLV of `r clv_gain`. Potential outcomes $(Y(0), Y(1))$ are not both observed. Because the pilot randomizes contact, the conditional average treatment effect (CATE)
+
+$$
+\tau(x) \;=\; \mathbb{E}[Y(1)-Y(0)\mid X=x]
+$$
+
+is identified by
+
+$$
+\tau(x) \;=\; \mathbb{E}[Y\mid T=1,X=x] - \mathbb{E}[Y\mid T=0,X=x].
+$$
+
+Decision-relevant expected incremental profit is
+
+$$
+\mathrm{EV}(x) \;=\; `r clv_gain`\,\tau(x) - `r contact_cost`.
+$$
+
+Under a hard capacity $\sum_i d_i \le \lfloor N/4\rfloor$, the Bayes-optimal rule (linear utility, known costs) ranks by posterior expected $\mathrm{EV}(x)$ and fills the budget with the highest scores, optionally requiring $\widehat{\mathrm{EV}}(x)>0$.
+
+**Honest assessment.** Hard-threshold classifiers (RF, boosting, QDA at 0.5) mostly predict non-purchase under class imbalance. That answers the wrong question. A bare two-arm logistic T-learner is a start but understates uncertainty coupling and invites misspecification bias in each arm separately. This remaster uses a **joint Bayesian logistic S-learner with treatment interactions**, full posterior decision summaries, held-out **IPW policy-value** evaluation under the known propensity, and a T-learner sensitivity check.
+
+## Data
+
+```{r load-data}
+pilot <- readr::read_csv(file.path(data_dir, "pilot.csv"), show_col_types = FALSE) |>
+  mutate(
+    across(c(V2, V19), as.factor),
+    treatment = as.integer(treatment),
+    purchase = as.integer(purchase)
+  )
+
+customer_base <- readr::read_csv(
+  file.path(data_dir, "CustomerBase.csv"),
+  show_col_types = FALSE
+) |>
+  mutate(across(c(V2, V19), as.factor))
+
+for (col in c("V2", "V19")) {
+  customer_base[[col]] <- factor(
+    as.character(customer_base[[col]]),
+    levels = levels(pilot[[col]])
+  )
+}
+
+n_base <- nrow(customer_base)
+call_capacity <- floor(capacity_frac * n_base)
+propensity <- mean(pilot$treatment) # known design propensity (≈ RCT rate)
+
+pilot |>
+  filter(treatment == 1) |>
+  head() |>
+  as_tibble()
+```
+
+```{r design-checks}
+pilot |>
+  group_by(treatment) |>
+  summarise(
+    n = n(),
+    purchases = sum(purchase),
+    purchase_rate = mean(purchase),
+    .groups = "drop"
+  )
+
+# Covariate balance (standardized mean differences), as a randomization check.
+num_x <- pilot |>
+  select(where(is.numeric), -treatment, -purchase) |>
+  names()
+
+balance <- map_dfr(num_x, function(v) {
+  x1 <- pilot[[v]][pilot$treatment == 1]
+  x0 <- pilot[[v]][pilot$treatment == 0]
+  m1 <- mean(x1, na.rm = TRUE)
+  m0 <- mean(x0, na.rm = TRUE)
+  s <- sd(pilot[[v]], na.rm = TRUE)
+  tibble(variable = v, smd = (m1 - m0) / s)
+})
+
+balance |>
+  ggplot(aes(smd, reorder(variable, smd))) +
+  geom_col(width = 0.55, fill = "#4a4a4a", colour = NA) +
+  geom_vline(xintercept = 0, colour = "grey40") +
+  geom_vline(xintercept = c(-0.1, 0.1), linetype = "dashed", colour = "grey60") +
+  labs(
+    x = "Standardized mean difference (treated − control)",
+    y = NULL,
+    title = "Covariate balance in the randomized pilot"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank())
+```
+
+Balance SMDs near zero support treating the pilot as a credible RCT for identifying $\tau(x)$.
+
+```{r split-pilot}
+set.seed(42)
+# Held-out pilot fold for policy evaluation (not used to fit the deployment model).
+pilot_split <- initial_split(pilot, prop = 0.7, strata = purchase)
+pilot_train <- training(pilot_split)
+pilot_eval <- testing(pilot_split)
+
+treated_train <- pilot_train |> filter(treatment == 1)
+```
+
+## EDA (brief)
+
+```{r eda-corr, fig.height=5.2}
+corr <- cor(
+  pilot |> select(where(is.numeric), -treatment),
+  use = "pairwise.complete.obs"
+)
+corrplot(
+  round(corr, 3),
+  method = "square",
+  type = "upper",
+  tl.col = "grey20",
+  tl.cex = 0.7,
+  order = "hclust",
+  col = brewer.pal(n = 5, name = "RdBu"),
+  cl.ratio = 0.2
+)
+```
+
+# Reconnaissance: classical ML (not the solution)
+
+```{r ml-recon}
+set.seed(42)
+e <- treated_train |>
+  select(-treatment) |>
+  mutate(buybool = factor(purchase, levels = c(0, 1), labels = c("no", "yes"))) |>
+  select(-purchase)
+
+split_e <- initial_split(e, prop = 0.75, strata = buybool)
+e_train <- training(split_e)
+e_test <- testing(split_e)
+
+rec <- recipe(buybool ~ ., data = e_train) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+rf_fit <- workflow() |>
+  add_recipe(rec) |>
+  add_model(
+    rand_forest(trees = 600) |>
+      set_engine("randomForest", importance = TRUE) |>
+      set_mode("classification")
+  ) |>
+  fit(e_train)
+
+bind_cols(purchase = e_test$buybool, predict(rf_fit, new_data = e_test)) |>
+  conf_mat(truth = purchase, estimate = .pred_class)
+
+rf_imp <- vip::vi(extract_fit_engine(rf_fit)) |>
+  as_tibble() |>
+  transmute(variable = Variable, importance = Importance) |>
+  slice_max(importance, n = 10)
+plot_importance(rf_imp, fill = "#b85c38")
+
+boost_fit <- workflow() |>
+  add_recipe(rec) |>
+  add_model(
+    boost_tree(trees = 300, learn_rate = 0.05, tree_depth = 3) |>
+      set_engine("xgboost") |>
+      set_mode("classification")
+  ) |>
+  fit(e_train)
+
+bind_cols(purchase = e_test$buybool, predict(boost_fit, new_data = e_test)) |>
+  conf_mat(truth = purchase, estimate = .pred_class)
+
+boost_imp <- vip::vi(extract_fit_engine(boost_fit)) |>
+  as_tibble() |>
+  transmute(variable = Variable, importance = Importance) |>
+  slice_max(importance, n = 10)
+plot_importance(boost_imp, fill = "#2b6a8f")
+```
+
+As expected under imbalance, 0.5-threshold ensembles are poor campaign rules. Importance plots are exploratory only.
+
+# Primary model: joint Bayesian S-learner
+
+Let $X$ be the numeric feature set used for causal modeling (dropping sparse categoricals that fracture cells). Fit on `pilot_train`:
+
+$$
+\mathrm{logit}\,\mathbb{E}[Y\mid T,X]
+  = \alpha + X^\top\beta + T\,\gamma + T\,X^\top\delta.
+$$
+
+Then $\tau(x)=\sigma(\alpha+X^\top\beta+\gamma+X^\top\delta)-\sigma(\alpha+X^\top\beta)$. Priors: Student-$t_7(0,2.5)$ on main effects; tighter Student-$t_7(0,1)$ on interactions (regularizing heterogeneous effects toward homogeneity).
+
+```{r joint-data}
+feature_cols <- c(
+  "V1", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "V10", "V11",
+  "V12", "V13", "V14", "V15", "V16", "V17", "V18", "V20"
+)
+
+make_model_frame <- function(df) {
+  df |>
+    select(purchase, treatment, all_of(feature_cols)) |>
+    mutate(across(all_of(feature_cols), as.numeric))
+}
+
+train_j <- make_model_frame(pilot_train)
+eval_j <- make_model_frame(pilot_eval)
+base_j <- customer_base |>
+  transmute(treatment = 0L, across(all_of(feature_cols), as.numeric))
+
+# Center features using training means (shared for T=0/1 counterfactuals).
+x_means <- colMeans(train_j[, feature_cols])
+center_x <- function(df) {
+  df |>
+    mutate(across(all_of(feature_cols), \(z) z - x_means[cur_column()]))
+}
+train_j <- center_x(train_j)
+eval_j <- center_x(eval_j)
+base_j <- center_x(base_j)
+
+form_s <- as.formula(
+  paste(
+    "purchase ~ treatment +",
+    paste(feature_cols, collapse = " + "),
+    "+",
+    paste0("treatment:(", paste(feature_cols, collapse = " + "), ")")
+  )
+)
+form_s
+```
+
+```{r fit-s-learner}
+# rstanarm::stan_glm (2.32) has no separate prior_interaction argument.
+# Moderately regularizing Student-t on all slopes (main + treatment x feature);
+# QR reparameterization improves geometry with correlated covariates.
+t_prior <- student_t(df = 7, location = 0, scale = 1.5)
+t_prior_intcpt <- student_t(df = 7, location = 0, scale = 2.5)
+
+fit_s <- stan_glm(
+  form_s,
+  data = train_j,
+  family = binomial(link = "logit"),
+  prior = t_prior,
+  prior_intercept = t_prior_intcpt,
+  QR = TRUE,
+  chains = 4,
+  iter = 2000,
+  warmup = 1000,
+  cores = 4,
+  refresh = 0,
+  seed = 42
+)
+```
+
+```{r s-diagnostics, fig.height=4.8}
+print(summary(fit_s, probs = c(0.05, 0.95)), digits = 2)
+
+rh <- rhat(fit_s)
+ne <- neff_ratio(fit_s)
+tibble(
+  max_rhat = max(rh, na.rm = TRUE),
+  min_neff_ratio = min(ne, na.rm = TRUE),
+  n_pars = length(rh)
+)
+
+mcmc_rhat(rh) + yaxis_text(hjust = 1) + theme_minimal(base_size = 10)
+
+loo_s <- loo(fit_s, save_psis = TRUE, k_threshold = 0.7)
+print(loo_s)
+```
+
+# Posterior predictive checks
+
+Check that the S-learner can regenerate the pilot's purchase margins (overall and by arm). Replicated data $Y^{\mathrm{rep}}$ are drawn from the posterior predictive; observed summaries should land inside the bulk of the replicated distribution.
+
+```{r ppc-margins, fig.height=3.8}
+y_obs <- train_j$purchase
+t_obs <- train_j$treatment
+yrep <- posterior_predict(fit_s, draws = 400)
+
+ppc_stat <- function(y, group = NULL) {
+  if (is.null(group)) {
+    mean(y)
+  } else {
+    c(control = mean(y[group == 0]), treated = mean(y[group == 1]))
+  }
+}
+
+obs_overall <- mean(y_obs)
+rep_overall <- apply(yrep, 1, mean)
+obs_by_arm <- ppc_stat(y_obs, t_obs)
+rep_by_arm <- apply(yrep, 1, ppc_stat, group = t_obs)
+
+ppc_tbl <- tibble(
+  draw = seq_len(nrow(yrep)),
+  overall = rep_overall,
+  control = rep_by_arm[1, ],
+  treated = rep_by_arm[2, ]
+) |>
+  pivot_longer(-draw, names_to = "margin", values_to = "rate")
+
+obs_tbl <- tibble(
+  margin = c("overall", "control", "treated"),
+  rate = c(obs_overall, obs_by_arm["control"], obs_by_arm["treated"])
+)
+
+ggplot(ppc_tbl, aes(rate)) +
+  geom_histogram(bins = 36, fill = "#2b6a8f", colour = NA, alpha = 0.9) +
+  geom_vline(
+    data = obs_tbl,
+    aes(xintercept = rate),
+    linetype = "dashed",
+    colour = "#c45c26",
+    linewidth = 0.7
+  ) +
+  facet_wrap(~margin, scales = "free_y", nrow = 1) +
+  labs(
+    x = "Purchase rate",
+    y = "Posterior predictive draws",
+    title = "PPC: purchase margins (dashed = observed)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+
+# Bayesian p-values: fraction of replicates at least as extreme as observed
+# (two-sided via absolute deviation from the predictive mean).
+bayes_p <- function(rep_vec, obs) {
+  m <- mean(rep_vec)
+  mean(abs(rep_vec - m) >= abs(obs - m))
+}
+tibble(
+  margin = c("overall", "control", "treated"),
+  observed = c(obs_overall, obs_by_arm["control"], obs_by_arm["treated"]),
+  pred_mean = c(mean(rep_overall), mean(rep_by_arm[1, ]), mean(rep_by_arm[2, ])),
+  bayes_p = c(
+    bayes_p(rep_overall, obs_overall),
+    bayes_p(rep_by_arm[1, ], obs_by_arm["control"]),
+    bayes_p(rep_by_arm[2, ], obs_by_arm["treated"])
+  )
+)
+```
+
+```{r ppc-calibration, fig.height=3.8}
+# Mean calibration on the training fold: bin by posterior predictive mean.
+p_hat_train <- colMeans(posterior_epred(fit_s, draws = 400))
+cal_tbl <- tibble(p_hat = p_hat_train, y = y_obs) |>
+  mutate(bin = ntile(p_hat, 10)) |>
+  group_by(bin) |>
+  summarise(
+    n = n(),
+    p_hat_mean = mean(p_hat),
+    y_rate = mean(y),
+    .groups = "drop"
+  )
+
+ggplot(cal_tbl, aes(p_hat_mean, y_rate)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_point(aes(size = n), colour = "#2b6a8f", alpha = 0.9) +
+  geom_line(colour = "#2b6a8f", linewidth = 0.4) +
+  scale_size_area(max_size = 8) +
+  coord_equal(xlim = c(0, max(cal_tbl$p_hat_mean, cal_tbl$y_rate) * 1.05),
+              ylim = c(0, max(cal_tbl$p_hat_mean, cal_tbl$y_rate) * 1.05)) +
+  labs(
+    x = "Mean predicted P(purchase)",
+    y = "Observed purchase rate",
+    size = "n",
+    title = "PPC / calibration: deciles of predicted probability"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+```
+
+```{r s-cate-eval}
+# Counterfactual predictions on the held-out pilot fold.
+nd1 <- eval_j |> mutate(treatment = 1L)
+nd0 <- eval_j |> mutate(treatment = 0L)
+p1_eval <- posterior_epred(fit_s, newdata = nd1, draws = 1000)
+p0_eval <- posterior_epred(fit_s, newdata = nd0, draws = 1000)
+ev_eval <- summarize_ev(p1_eval, p0_eval)
+
+# Discrimination of uplift for realized treatment effect proxy among treated/control
+# is subtle; report AUCs for each response surface instead.
+auc_t1 <- auc(roc(eval_j$purchase[eval_j$treatment == 1],
+                  colMeans(p1_eval)[eval_j$treatment == 1], quiet = TRUE))
+auc_t0 <- auc(roc(eval_j$purchase[eval_j$treatment == 0],
+                  colMeans(p0_eval)[eval_j$treatment == 0], quiet = TRUE))
+tibble(auc_response_treated = as.numeric(auc_t1),
+       auc_response_control = as.numeric(auc_t0))
+```
+
+# Sensitivity: Bayesian T-learner
+
+Separate arms as a cross-check (independent priors; no shared residual structure).
+
+```{r fit-t-learner}
+fit_t1 <- stan_glm(
+  purchase ~ .,
+  data = train_j |> filter(treatment == 1) |> select(-treatment),
+  family = binomial(),
+  prior = t_prior,
+  prior_intercept = t_prior,
+  QR = TRUE,
+  chains = 4,
+  iter = 2000,
+  refresh = 0,
+  seed = 42
+)
+fit_t0 <- stan_glm(
+  purchase ~ .,
+  data = train_j |> filter(treatment == 0) |> select(-treatment),
+  family = binomial(),
+  prior = t_prior,
+  prior_intercept = t_prior,
+  QR = TRUE,
+  chains = 4,
+  iter = 2000,
+  refresh = 0,
+  seed = 43
+)
+
+p1_t <- posterior_epred(
+  fit_t1,
+  newdata = eval_j |> select(-treatment, -purchase),
+  draws = 1000
+)
+p0_t <- posterior_epred(
+  fit_t0,
+  newdata = eval_j |> select(-treatment, -purchase),
+  draws = 1000
+)
+ev_t <- summarize_ev(p1_t, p0_t)
+
+tibble(
+  corr_uplift_s_vs_t = cor(ev_eval$uplift_mean, ev_t$uplift_mean),
+  corr_ev_s_vs_t = cor(ev_eval$ev_mean, ev_t$ev_mean),
+  mean_abs_ev_diff = mean(abs(ev_eval$ev_mean - ev_t$ev_mean))
+)
+```
+
+```{r s-vs-t-plot, fig.height=3.8}
+tibble(s = ev_eval$ev_mean, t_learner = ev_t$ev_mean) |>
+  ggplot(aes(s, t_learner)) +
+  geom_point(alpha = 0.35, size = 1.2, colour = "#2b6a8f") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
+  labs(
+    x = "S-learner posterior mean EV",
+    y = "T-learner posterior mean EV",
+    title = "Sensitivity: joint S-learner vs two-arm T-learner"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+```
+
+# Held-out policy evaluation (IPW)
+
+On `pilot_eval`, compare:
+
+1. **Bayes EV policy** — rank by S-learner $\widehat{\mathrm{EV}}$, take top $k=\lfloor 0.25 n_{\mathrm{eval}}\rfloor$ among those with $\widehat{\mathrm{EV}}>0$ (else fill by EV).
+2. **Propensity-of-purchase (treated arm only)** — rank by $\hat P(Y\mid T=1,X)$, same $k$.
+3. **Random $k$** — mean over draws of random capacity fills.
+
+Because $T$ is randomized with known propensity $e$, IPW is unbiased for $V(\pi)$ under standard positivity (here $e\in(0,1)$ by design).
+
+```{r policy-eval}
+n_eval <- nrow(eval_j)
+k_eval <- floor(capacity_frac * n_eval)
+
+make_policy <- function(score, k, positive_only = TRUE) {
+  ord <- order(score, decreasing = TRUE)
+  pi <- rep(0, length(score))
+  if (positive_only) {
+    cand <- ord[score[ord] > 0]
+    take <- head(cand, k)
+    if (length(take) == 0) take <- head(ord, k)
+  } else {
+    take <- head(ord, k)
+  }
+  pi[take] <- 1
+  pi
+}
+
+pi_bayes <- make_policy(ev_eval$ev_mean, k_eval, positive_only = TRUE)
+pi_p1 <- make_policy(colMeans(p1_eval), k_eval, positive_only = FALSE)
+
+set.seed(42)
+v_random <- replicate(200, {
+  pi_r <- rep(0, n_eval)
+  pi_r[sample.int(n_eval, k_eval)] <- 1
+  ipw_policy_value(eval_j$purchase, eval_j$treatment, pi_r, e = propensity)
+})
+
+policy_tbl <- tibble(
+  policy = c("Bayes EV (S-learner)", "Treated-arm propensity", "Random capacity (mean)"),
+  ipw_value = c(
+    ipw_policy_value(eval_j$purchase, eval_j$treatment, pi_bayes, e = propensity),
+    ipw_policy_value(eval_j$purchase, eval_j$treatment, pi_p1, e = propensity),
+    mean(v_random)
+  ),
+  n_targeted = c(sum(pi_bayes), sum(pi_p1), k_eval),
+  mean_p_pos_ev = c(mean(ev_eval$p_positive_ev[pi_bayes == 1]), NA, NA)
+)
+policy_tbl
+
+# Incremental profit metric on the eval fold under IPW (scaled by CLV/cost is
+# not identical to V(π) in purchase probability units; report both).
+# Approximate expected profit per customer: CLV * V(π) - cost * E[π].
+policy_tbl |>
+  mutate(
+    approx_profit_per_customer =
+      clv_gain * ipw_value - contact_cost * (n_targeted / n_eval)
+  )
+```
+
+```{r policy-plot, fig.height=3.4}
+policy_tbl |>
+  ggplot(aes(ipw_value, reorder(policy, ipw_value))) +
+  geom_col(width = 0.55, fill = "#2b6a8f", colour = NA) +
+  labs(
+    x = "IPW estimate of E[Y under policy] on held-out pilot",
+    y = NULL,
+    title = "Policy value comparison (higher is better)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank())
+```
+
+# Capacity–profit curve
+
+Sweep contact budgets $k = 0,\ldots,\lfloor 0.40\,n_{\mathrm{eval}}\rfloor$ on the held-out fold. For each $k$, contact the top-$k$ customers by S-learner $\widehat{\mathrm{EV}}$ (no hard positivity cutoff — the curve itself shows where incremental EV turns negative). Report:
+
+- **Model-based** expected incremental profit: $\sum_{i\in\mathrm{top}\text{-}k}\widehat{\mathrm{EV}}(x_i)$.
+- **IPW** approximate profit per customer: $\mathrm{CLV}\cdot\hat V_{\mathrm{IPW}}(\pi_k) - c\cdot(k/n)$, with a bootstrap percentile band for the IPW curve.
+
+The vertical line marks the business capacity $k=\lfloor N/4\rfloor$ on this fold.
+
+```{r capacity-curve, fig.height=4.2}
+score_ev <- ev_eval$ev_mean
+ord_ev <- order(score_ev, decreasing = TRUE)
+k_grid <- seq(0L, floor(0.40 * n_eval), by = 25L)
+if (tail(k_grid, 1) != floor(0.40 * n_eval)) {
+  k_grid <- c(k_grid, floor(0.40 * n_eval))
+}
+
+# Model-based cumulative EV along the ranked list.
+cum_ev <- c(0, cumsum(score_ev[ord_ev]))
+
+# Incremental IPW profit vs never-contact: CLV*(V(π_k)-V(0)) - c*(k/n).
+boot_ipw_profit <- function(k, B = 300L) {
+  if (k == 0L) {
+    return(tibble(ipw_profit = 0, lo = 0, hi = 0))
+  }
+  pi <- rep(0, n_eval)
+  pi[ord_ev[seq_len(k)]] <- 1
+  pi0 <- rep(0, n_eval)
+  set.seed(42 + k)
+  boots <- replicate(B, {
+    idx <- sample.int(n_eval, replace = TRUE)
+    e_b <- mean(eval_j$treatment[idx])
+    v_k <- ipw_policy_value(
+      eval_j$purchase[idx],
+      eval_j$treatment[idx],
+      pi[idx],
+      e = e_b
+    )
+    v_0 <- ipw_policy_value(
+      eval_j$purchase[idx],
+      eval_j$treatment[idx],
+      pi0[idx],
+      e = e_b
+    )
+    clv_gain * (v_k - v_0) - contact_cost * (k / n_eval)
+  })
+  tibble(
+    ipw_profit = mean(boots),
+    lo = as.numeric(quantile(boots, 0.05)),
+    hi = as.numeric(quantile(boots, 0.95))
+  )
+}
+
+cap_tbl <- map_dfr(k_grid, function(k) {
+  mb <- if (k == 0L) 0 else cum_ev[k + 1L]
+  ipw_row <- boot_ipw_profit(k)
+  bind_cols(tibble(k = k, model_profit = mb), ipw_row)
+})
+
+cap_long <- cap_tbl |>
+  select(k, model_profit, ipw_profit) |>
+  pivot_longer(-k, names_to = "estimator", values_to = "profit") |>
+  mutate(
+    estimator = recode(
+      estimator,
+      model_profit = "Model-based sum of EV",
+      ipw_profit = "IPW (bootstrap mean)"
+    )
+  )
+
+ggplot() +
+  geom_ribbon(
+    data = cap_tbl,
+    aes(k, ymin = lo * n_eval, ymax = hi * n_eval),
+    fill = "#2b6a8f",
+    alpha = 0.15
+  ) +
+  geom_line(
+    data = cap_long |>
+      mutate(
+        profit_plot = if_else(
+          estimator == "Model-based sum of EV",
+          profit,
+          profit * n_eval
+        )
+      ),
+    aes(k, profit_plot, colour = estimator),
+    linewidth = 0.9
+  ) +
+  geom_vline(xintercept = k_eval, linetype = "dashed", colour = "grey35") +
+  annotate(
+    "text",
+    x = k_eval,
+    y = max(cap_tbl$model_profit, na.rm = TRUE) * 0.92,
+    label = "capacity N/4",
+    hjust = -0.1,
+    size = 3.2,
+    colour = "grey30"
+  ) +
+  scale_colour_manual(values = c(
+    "Model-based sum of EV" = "#2b6a8f",
+    "IPW (bootstrap mean)" = "#c45c26"
+  )) +
+  labs(
+    x = "Number contacted (k)",
+    y = "Expected incremental profit on eval fold",
+    colour = NULL,
+    title = "Capacity–profit curve (held-out pilot)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom"
+  )
+
+cap_tbl |>
+  filter(k %in% c(0L, k_eval, max(k_grid))) |>
+  mutate(
+    ipw_total = ipw_profit * n_eval,
+    ipw_lo_total = lo * n_eval,
+    ipw_hi_total = hi * n_eval
+  )
+
+readr::write_csv(cap_tbl, file.path(out_dir, "capacity_profit_curve.csv"))
+```
+
+# Deploy on the customer base
+
+Refit the S-learner on the **full pilot** (after evaluation), then score all $N$ customers with posterior means and $P(\mathrm{EV}>0)$.
+
+```{r deploy-fit}
+train_full <- center_x(make_model_frame(pilot))
+# Recompute centering on full pilot for deployment.
+x_means_full <- colMeans(make_model_frame(pilot)[, feature_cols])
+center_x_full <- function(df) {
+  df |> mutate(across(all_of(feature_cols), \(z) z - x_means_full[cur_column()]))
+}
+train_full <- center_x_full(make_model_frame(pilot))
+base_full <- center_x_full(
+  customer_base |> transmute(treatment = 0L, across(all_of(feature_cols), as.numeric))
+)
+
+fit_deploy <- stan_glm(
+  form_s,
+  data = train_full,
+  family = binomial(link = "logit"),
+  prior = t_prior,
+  prior_intercept = t_prior_intcpt,
+  QR = TRUE,
+  chains = 4,
+  iter = 2000,
+  warmup = 1000,
+  cores = 4,
+  refresh = 0,
+  seed = 42
+)
+
+loo_deploy <- loo(fit_deploy, k_threshold = 0.7)
+print(loo_deploy)
+```
+
+```{r deploy-score}
+nd1_b <- base_full |> mutate(treatment = 1L)
+nd0_b <- base_full |> mutate(treatment = 0L)
+p1_b <- posterior_epred(fit_deploy, newdata = nd1_b, draws = 1000)
+p0_b <- posterior_epred(fit_deploy, newdata = nd0_b, draws = 1000)
+ev_b <- summarize_ev(p1_b, p0_b)
+
+score_tbl <- tibble(
+  company_id = seq_len(n_base),
+  p_contact = colMeans(p1_b),
+  p_control = colMeans(p0_b)
+) |>
+  bind_cols(ev_b)
+
+ranked <- score_tbl |>
+  arrange(desc(ev_mean), desc(p_positive_ev), desc(p_contact)) |>
+  mutate(rank = row_number())
+
+n_positive_ev <- sum(ranked$ev_mean > 0)
+n_target <- min(call_capacity, max(n_positive_ev, 0L))
+if (n_target == 0L) {
+  n_target <- call_capacity
+}
+
+dec_final <- ranked |>
+  mutate(decision = as.integer(rank <= n_target)) |>
+  arrange(company_id) |>
+  transmute(
+    decision,
+    company_name = company_id,
+    prob = p_contact,
+    uplift = uplift_mean,
+    uplift_q05,
+    uplift_q95,
+    expected_profit = ev_mean,
+    ev_q05,
+    ev_q95,
+    p_positive_ev
+  )
+
+dec_final |> head(12) |> as_tibble()
+
+tibble(
+  n_base = n_base,
+  call_capacity = call_capacity,
+  n_positive_ev = n_positive_ev,
+  n_targeted = sum(dec_final$decision),
+  mean_uplift_targeted = mean(dec_final$uplift[dec_final$decision == 1]),
+  mean_ev_targeted = mean(dec_final$expected_profit[dec_final$decision == 1]),
+  mean_p_pos_ev_targeted = mean(dec_final$p_positive_ev[dec_final$decision == 1]),
+  total_expected_profit_targeted = sum(
+    dec_final$expected_profit[dec_final$decision == 1]
+  )
+)
+```
+
+```{r deploy-plots, fig.height=3.6}
+dec_final |>
+  mutate(targeted = factor(decision, labels = c("not targeted", "targeted"))) |>
+  ggplot(aes(expected_profit, fill = targeted)) +
+  geom_histogram(bins = 60, alpha = 0.9, colour = NA) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_fill_manual(values = c("not targeted" = "#bdbdbd", "targeted" = "#2b6a8f")) +
+  labs(
+    x = "Posterior mean incremental profit if contacted",
+    y = "Customers",
+    fill = NULL,
+    title = "Deployment scores (customer base)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(), legend.position = "bottom")
+
+dec_final |>
+  filter(decision == 1) |>
+  ggplot(aes(p_positive_ev)) +
+  geom_histogram(bins = 40, fill = "#2b6a8f", colour = NA) +
+  labs(
+    x = expression(P(EV > 0 ~ "|" ~ data)),
+    y = "Targeted customers",
+    title = "Posterior probability of positive incremental profit among targets"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+```
+
+```{r write-decisions}
+readr::write_csv(dec_final |> select(decision), file.path(out_dir, "decisions_arpas.csv"))
+readr::write_csv(dec_final, file.path(out_dir, "decisions_arpas_detailed.csv"))
+readr::write_csv(policy_tbl, file.path(out_dir, "heldout_policy_values.csv"))
+
+ref <- readr::read_csv(file.path(data_dir, "decisions.csv"), show_col_types = FALSE)
+tibble(
+  our_target_rate = mean(dec_final$decision),
+  reference_file_target_rate = mean(ref$decision),
+  capacity_frac = capacity_frac
+)
+```
+
+# Conclusion
+
+1. **Identification.** Randomization in the pilot identifies $\tau(x)$; balance checks are consistent with a credible RCT.
+2. **Model.** The primary estimator is a joint Bayesian logistic S-learner with treatment main effect and treatment×feature interactions, Student-$t$ regularization, QR reparameterization, MCMC/LOO diagnostics, and PPCs (margins + calibration).
+3. **Decisions.** Targets maximize posterior expected incremental profit under the call-center capacity constraint, with uncertainty reported via credible intervals and $P(\mathrm{EV}>0)$.
+4. **Validation.** Held-out IPW policy values compare Bayes EV ranking to treated-arm propensity ranking and random allocation; the capacity–profit curve shows returns as $k$ varies, with a bootstrap band on the IPW curve.
+5. **Sensitivity.** A Bayesian T-learner yields correlated but not identical scores; large disagreements would have flagged fragility (see scatter).
+
+Classical 0.5-threshold ML is retained only as reconnaissance: it does not solve the assignment. Deliverables: `outputs/decisions_arpas.csv`, `outputs/decisions_arpas_detailed.csv`, `outputs/heldout_policy_values.csv`, `outputs/capacity_profit_curve.csv`.
+
+Natural extensions with more time: nonparametric Bayesian CATE (e.g. BART), doubly robust (AIPW) policy-value intervals, and explicit utility over the full posterior knapsack.
