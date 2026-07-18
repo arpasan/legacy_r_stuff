@@ -7,3 +7,4 @@
 projects/**/outputs/*.csv
 !projects/**/outputs/.gitkeep
 !projects/**/outputs/decisions_arpas_legacy.csv
+AGENTS.md
