@@ -16,6 +16,3 @@ AGENTS.md
 !profit_optimization/outputs/decisions_arpas_legacy.csv
 !profit_optimization/outputs/heldout_policy_values.csv
 !profit_optimization/outputs/capacity_profit_curve.csv
-
-# Legacy path exception while Econ still lives under projects/
-!projects/**/outputs/decisions_arpas_legacy.csv
