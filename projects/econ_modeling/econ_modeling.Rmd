@@ -1,7 +1,7 @@
 ---
 title: "Economic Modeling"
 author: "Andrej Arpáš"
-date: "2026-07-17"
+date: "12/16/2019"
 output:
   html_document:
     code_folding: show
