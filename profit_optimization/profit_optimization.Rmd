@@ -888,46 +888,25 @@ tibble(
 ```{r deploy-plots, fig.height=3.6}
 dec_final |>
   mutate(targeted = factor(decision, labels = c("not targeted", "targeted"))) |>
-  ggplot(aes(expected_profit, colour = targeted, fill = targeted)) +
-  geom_density(alpha = 0.12, linewidth = 0.55, key_glyph = "path") +
-  geom_vline(xintercept = 0, linetype = "22", colour = "grey45", linewidth = 0.4) +
-  scale_colour_manual(values = c(
-    "not targeted" = col_pastel_slate,
-    "targeted" = col_pastel_blue
-  )) +
-  scale_fill_manual(values = c(
-    "not targeted" = col_pastel_slate,
-    "targeted" = col_pastel_blue
-  )) +
+  ggplot(aes(expected_profit, fill = targeted)) +
+  geom_histogram(bins = 60, alpha = 0.9, colour = NA) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_fill_manual(values = c("not targeted" = "#bdbdbd", "targeted" = "#2b6a8f")) +
   labs(
     x = "Posterior mean incremental profit if contacted",
-    y = "Density",
-    colour = NULL,
+    y = "Customers",
     fill = NULL,
     title = "Deployment scores (customer base)"
   ) +
   theme_minimal(base_size = 11) +
-  theme(
-    panel.grid.minor = element_blank(),
-    legend.position = "bottom"
-  )
+  theme(panel.grid.minor = element_blank(), legend.position = "bottom")
 
-# Posterior-style density with stripe hatch (not a histogram).
+# Posterior-style density: transparent turquoise fill, no outline.
+col_ppos <- "#40b8b0"
 dec_final |>
   filter(decision == 1) |>
   ggplot(aes(p_positive_ev)) +
-  geom_density_pattern(
-    pattern = "stripe",
-    fill = "white",
-    colour = col_pastel_blue,
-    linewidth = 0.65,
-    pattern_angle = 45,
-    pattern_colour = col_pastel_blue,
-    pattern_fill = "white",
-    pattern_density = 0.55,
-    pattern_spacing = 0.018,
-    pattern_alpha = 1
-  ) +
+  geom_density(fill = col_ppos, colour = NA, alpha = 0.22) +
   labs(
     x = expression(P(EV > 0 ~ "|" ~ data)),
     y = "Density",
