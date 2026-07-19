@@ -45,12 +45,12 @@ options(mc.cores = max(1L, parallel::detectCores() - 1L))
 set.seed(42)
 
 data_dir <- "data"
-out_dir <- "outputs"
-dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
 contact_cost <- 5
 clv_gain <- 100
 capacity_frac <- 0.25
+# Single assignment-style deliverable (Decisions.csv format): one column, N rows.
+decisions_path <- "decisions_recommended.csv"
 
 # Pastel palette for hatched bars / posterior curves.
 col_pastel_blue <- "#8eb6c8"
@@ -138,9 +138,9 @@ $$
 \mathrm{EV}(x) \;=\; `r clv_gain`\,\tau(x) - `r contact_cost`.
 $$
 
-Under a hard capacity $\sum_i d_i \le \lfloor N/4\rfloor$, the Bayes-optimal rule (linear utility, known costs) ranks by posterior expected $\mathrm{EV}(x)$ and fills the budget with the highest scores, optionally requiring $\widehat{\mathrm{EV}}(x)>0$.
+Under a hard capacity $\sum_i d_i \le \lfloor N/4\rfloor$, the Bayes-optimal rule (linear utility, known costs) ranks customers by posterior expected $\mathrm{EV}(x)$ and contacts the highest-scoring clients, never exceeding capacity and never contacting a client whose posterior mean $\mathrm{EV}$ is negative.
 
-Purchase prediction at a fixed 0.5 threshold is a natural baseline, but the operational objective is expected incremental profit under a capacity constraint. The analysis therefore centers on a **joint Bayesian logistic S-learner with treatment interactions**, posterior decision summaries, held-out **IPW policy-value** evaluation under the known propensity, and a Bayesian T-learner sensitivity check.
+Purchase prediction at a fixed 0.5 threshold is a natural baseline, but the operational objective is expected incremental profit under that capacity constraint. The analysis therefore fits ensemble classifiers on the treated pilot arm, then centers the recommendation on a **joint Bayesian logistic S-learner with treatment interactions**, with held-out **IPW policy-value** checks and a Bayesian T-learner sensitivity comparison. The required output is a single binary recommendation per row of `CustomerBase.csv` (same format as the provided `decisions.csv` template).
 
 ## Data
 
@@ -641,19 +641,18 @@ policy_tbl <- tibble(
     ipw_policy_value(eval_j$purchase, eval_j$treatment, pi_p1, e = propensity),
     mean(v_random)
   ),
-  n_targeted = c(sum(pi_bayes), sum(pi_p1), k_eval),
-  mean_p_pos_ev = c(mean(ev_eval$p_positive_ev[pi_bayes == 1]), NA, NA)
-)
-policy_tbl
-
-# Incremental profit metric on the eval fold under IPW (scaled by CLV/cost is
-# not identical to V(π) in purchase probability units; report both).
-# Approximate expected profit per customer: CLV * V(π) - cost * E[π].
-policy_tbl |>
+  n_targeted = c(sum(pi_bayes), sum(pi_p1), k_eval)
+) |>
   mutate(
     approx_profit_per_customer =
       clv_gain * ipw_value - contact_cost * (n_targeted / n_eval)
   )
+
+knitr::kable(
+  policy_tbl,
+  digits = 4,
+  caption = "Held-out IPW policy comparison on the pilot eval fold"
+)
 ```
 
 ```{r policy-plot, fig.height=3.4}
@@ -786,18 +785,23 @@ ggplot() +
 
 cap_tbl |>
   filter(k %in% c(0L, k_eval, max(k_grid))) |>
-  mutate(
-    ipw_total = ipw_profit * n_eval,
-    ipw_lo_total = lo * n_eval,
-    ipw_hi_total = hi * n_eval
-  )
-
-readr::write_csv(cap_tbl, file.path(out_dir, "capacity_profit_curve.csv"))
+  transmute(
+    k,
+    model_profit,
+    ipw_profit_on_fold = ipw_profit * n_eval,
+    ipw_lo = lo * n_eval,
+    ipw_hi = hi * n_eval
+  ) |>
+  knitr::kable(digits = 1, caption = "Selected points on the capacity–profit curve (eval fold)")
 ```
 
-# Deploy on the customer base
+# Solution: recommended contacts for the customer base
 
-Refit the S-learner on the **full pilot** (after evaluation), then score all $N$ customers with posterior means and $P(\mathrm{EV}>0)$.
+Refit the S-learner on the **full pilot**, score every row of `CustomerBase.csv`, and form the contact list that the brief asks for: a binary $decision_i$ for each customer, with $\sum_i decision_i \le \lfloor N/4\rfloor$.
+
+**Decision rule.** Rank by posterior mean incremental profit $\widehat{\mathrm{EV}}(x)$. Contact the top $k$ customers where
+$k=\min\big(\lfloor N/4\rfloor,\,\#\{x:\widehat{\mathrm{EV}}(x)>0\}\big)$.
+That fills the call-center budget only with clients expected to add profit; it leaves capacity unused if fewer than $N/4$ clients have positive expected incremental profit.
 
 ```{r deploy-fit}
 train_full <- center_x(make_model_frame(pilot))
@@ -870,19 +874,32 @@ dec_final <- ranked |>
     p_positive_ev
   )
 
-dec_final |> head(12) |> as_tibble()
-
-tibble(
-  n_base = n_base,
+solution_summary <- tibble(
+  n_customers = n_base,
   call_capacity = call_capacity,
-  n_positive_ev = n_positive_ev,
-  n_targeted = sum(dec_final$decision),
-  mean_uplift_targeted = mean(dec_final$uplift[dec_final$decision == 1]),
-  mean_ev_targeted = mean(dec_final$expected_profit[dec_final$decision == 1]),
-  mean_p_pos_ev_targeted = mean(dec_final$p_positive_ev[dec_final$decision == 1]),
-  total_expected_profit_targeted = sum(
+  n_with_positive_ev = n_positive_ev,
+  n_contacted = sum(dec_final$decision),
+  capacity_used_frac = sum(dec_final$decision) / call_capacity,
+  mean_uplift_among_contacts = mean(dec_final$uplift[dec_final$decision == 1]),
+  mean_ev_among_contacts = mean(dec_final$expected_profit[dec_final$decision == 1]),
+  mean_p_ev_pos_among_contacts = mean(dec_final$p_positive_ev[dec_final$decision == 1]),
+  total_expected_incremental_profit = sum(
     dec_final$expected_profit[dec_final$decision == 1]
   )
+)
+knitr::kable(
+  solution_summary,
+  digits = 3,
+  caption = "Solution summary on CustomerBase (posterior means from the deployment S-learner)"
+)
+
+knitr::kable(
+  dec_final |>
+    mutate(row = company_name) |>
+    select(row, decision, expected_profit, uplift, p_positive_ev, prob) |>
+    head(15),
+  digits = 3,
+  caption = "First 15 customer-base rows with recommended decision and score components (row order matches CustomerBase.csv)"
 )
 ```
 
@@ -897,12 +914,11 @@ dec_final |>
     x = "Posterior mean incremental profit if contacted",
     y = "Customers",
     fill = NULL,
-    title = "Deployment scores (customer base)"
+    title = "Customer-base scores under the recommended contact rule"
   ) +
   theme_minimal(base_size = 11) +
   theme(panel.grid.minor = element_blank(), legend.position = "bottom")
 
-# Posterior-style density: transparent turquoise fill, no outline.
 col_ppos <- "#2ec4b6"
 dec_final |>
   filter(decision == 1) |>
@@ -911,32 +927,31 @@ dec_final |>
   labs(
     x = expression(P(EV > 0 ~ "|" ~ data)),
     y = "Density",
-    title = "Posterior probability of positive incremental profit among targets"
+    title = "P(EV > 0) among contacted customers"
   ) +
   theme_minimal(base_size = 11) +
   theme(panel.grid.minor = element_blank())
 ```
-```{r write-decisions}
-readr::write_csv(dec_final |> select(decision), file.path(out_dir, "decisions_arpas.csv"))
-readr::write_csv(dec_final, file.path(out_dir, "decisions_arpas_detailed.csv"))
-readr::write_csv(policy_tbl, file.path(out_dir, "heldout_policy_values.csv"))
 
-ref <- readr::read_csv(file.path(data_dir, "decisions.csv"), show_col_types = FALSE)
-tibble(
-  our_target_rate = mean(dec_final$decision),
-  reference_file_target_rate = mean(ref$decision),
-  capacity_frac = capacity_frac
-)
+The full length-$N$ recommendation vector (one `decision` column, same order as `CustomerBase.csv`) is written to `decisions_recommended.csv` for offline use. The template file `data/decisions.csv` illustrates that format only; it is not a scored answer key (its contact rate exceeds capacity).
+
+```{r write-decisions}
+readr::write_csv(dec_final |> select(decision), decisions_path)
+stopifnot(nrow(readr::read_csv(decisions_path, show_col_types = FALSE)) == n_base)
+stopifnot(sum(dec_final$decision) <= call_capacity)
+cat(sprintf(
+  "Wrote %s: %d contacts out of %d (capacity %d).\n",
+  decisions_path, sum(dec_final$decision), n_base, call_capacity
+))
 ```
 
 # Conclusion
 
-1. **Identification.** Randomization in the pilot identifies $\tau(x)$; balance checks are consistent with a credible RCT.
-2. **Model.** The primary estimator is a joint Bayesian logistic S-learner with treatment main effect and treatment×feature interactions, Student-$t$ regularization, QR reparameterization, MCMC/LOO diagnostics, and PPCs (margins + calibration).
-3. **Decisions.** Targets maximize posterior expected incremental profit under the call-center capacity constraint, with uncertainty reported via credible intervals and $P(\mathrm{EV}>0)$.
-4. **Validation.** Held-out IPW policy values compare Bayes EV ranking to treated-arm propensity ranking and random allocation; the capacity–profit curve shows returns as $k$ varies, with a bootstrap band on the IPW curve.
-5. **Sensitivity.** A Bayesian T-learner yields correlated but not identical scores; large disagreements would have flagged fragility (see scatter).
+The marketing problem is solved by a capacity-feasible contact list for every customer in `CustomerBase.csv`:
 
-Baselines that classify purchase at a fixed 0.5 threshold remain useful for describing the outcome margin, but the contact rule itself is the capacity-constrained ranking by posterior expected incremental profit. Decision and evaluation tables are written to `outputs/` (`decisions_arpas.csv`, `decisions_arpas_detailed.csv`, `heldout_policy_values.csv`, `capacity_profit_curve.csv`).
+1. The randomized pilot identifies $\tau(x)$; ensemble classifiers describe purchase patterns on the treated arm.
+2. The primary scoring model is a joint Bayesian logistic S-learner with treatment×feature interactions (Student-$t$ priors, QR, MCMC/LOO, PPCs).
+3. Each customer is ranked by posterior mean incremental profit $\mathrm{EV}(x)=100\,\tau(x)-5$; contacts are the top scores with $\widehat{\mathrm{EV}}(x)>0$, subject to $\sum decision_i\le\lfloor N/4\rfloor$.
+4. Held-out IPW checks and the capacity–profit curve support that EV ranking beats treated-arm propensity and random allocation on the pilot fold; a T-learner sensitivity check yields correlated scores.
 
-Natural extensions include nonparametric Bayesian CATE (e.g. BART), doubly robust (AIPW) policy-value intervals, and explicit utility over the full posterior knapsack.
+The recommendation itself is summarized in the tables above and stored as `decisions_recommended.csv`.

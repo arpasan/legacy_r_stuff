@@ -1,4 +1,0 @@
-policy,ipw_value,n_targeted,mean_p_pos_ev
-Bayes EV (S-learner),0.10763241510692488,249,0.7065582329317269
-Treated-arm propensity,0.08936293433552392,375,NA
-Random capacity (mean),0.08647079551586727,375,NA

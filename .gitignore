@@ -6,13 +6,5 @@
 **/*_files/
 AGENTS.md
 
-# Default: ignore generated CSVs under outputs/
-**/outputs/*.csv
-!**/outputs/.gitkeep
-
-# Profit Optimization decision / evaluation tables (tracked)
-!profit_optimization/outputs/decisions_arpas.csv
-!profit_optimization/outputs/decisions_arpas_detailed.csv
-!profit_optimization/outputs/decisions_arpas_legacy.csv
-!profit_optimization/outputs/heldout_policy_values.csv
-!profit_optimization/outputs/capacity_profit_curve.csv
+# Scratch outputs (the assignment deliverable is decisions_recommended.csv)
+**/outputs/
