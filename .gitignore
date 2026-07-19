@@ -10,7 +10,7 @@ AGENTS.md
 **/outputs/*.csv
 !**/outputs/.gitkeep
 
-# Profit Optimization deliverables (ship with the remaster)
+# Profit Optimization decision / evaluation tables (tracked)
 !profit_optimization/outputs/decisions_arpas.csv
 !profit_optimization/outputs/decisions_arpas_detailed.csv
 !profit_optimization/outputs/decisions_arpas_legacy.csv

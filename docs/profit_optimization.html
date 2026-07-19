@@ -1687,7 +1687,7 @@ border-radius: 0px;
 
 <h1 class="title toc-ignore">Profit Optimization</h1>
 <h3 class="subtitle">Causal Decision Analysis under a Capacity
-Constraint (figures: c7e2d24+)</h3>
+Constraint</h3>
 <h4 class="author">Andrej Arpáš</h4>
 <h4 class="date">12/15/2020</h4>
 
@@ -1723,15 +1723,13 @@ average treatment effect (CATE)</p>
 \lfloor N/4\rfloor\)</span>, the Bayes-optimal rule (linear utility,
 known costs) ranks by posterior expected <span class="math inline">\(\mathrm{EV}(x)\)</span> and fills the budget with
 the highest scores, optionally requiring <span class="math inline">\(\widehat{\mathrm{EV}}(x)&gt;0\)</span>.</p>
-<p><strong>Honest assessment.</strong> Hard-threshold classifiers (RF,
-boosting, QDA at 0.5) mostly predict non-purchase under class imbalance.
-That answers the wrong question. A bare two-arm logistic T-learner is a
-start but understates uncertainty coupling and invites misspecification
-bias in each arm separately. This remaster uses a <strong>joint Bayesian
-logistic S-learner with treatment interactions</strong>, full posterior
-decision summaries, held-out <strong>IPW policy-value</strong>
-evaluation under the known propensity, and a T-learner sensitivity
-check.</p>
+<p>Purchase prediction at a fixed 0.5 threshold is a natural baseline,
+but the operational objective is expected incremental profit under a
+capacity constraint. The analysis therefore centers on a <strong>joint
+Bayesian logistic S-learner with treatment interactions</strong>,
+posterior decision summaries, held-out <strong>IPW policy-value</strong>
+evaluation under the known propensity, and a Bayesian T-learner
+sensitivity check.</p>
 <div id="data" class="section level2">
 <h2>Data</h2>
 <div class="sourceCode" id="cb1"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb1-1"><a href="#cb1-1" tabindex="-1"></a>pilot <span class="ot">&lt;-</span> readr<span class="sc">::</span><span class="fu">read_csv</span>(<span class="fu">file.path</span>(data_dir, <span class="st">&quot;pilot.csv&quot;</span>), <span class="at">show_col_types =</span> <span class="cn">FALSE</span>) <span class="sc">|&gt;</span></span>
@@ -2732,15 +2730,17 @@ IPW curve.</li>
 but not identical scores; large disagreements would have flagged
 fragility (see scatter).</li>
 </ol>
-<p>Classical 0.5-threshold ML is retained only as reconnaissance: it
-does not solve the assignment. Deliverables:
-<code>outputs/decisions_arpas.csv</code>,
-<code>outputs/decisions_arpas_detailed.csv</code>,
-<code>outputs/heldout_policy_values.csv</code>,
-<code>outputs/capacity_profit_curve.csv</code>.</p>
-<p>Natural extensions with more time: nonparametric Bayesian CATE
-(e.g. BART), doubly robust (AIPW) policy-value intervals, and explicit
-utility over the full posterior knapsack.</p>
+<p>Baselines that classify purchase at a fixed 0.5 threshold remain
+useful for describing the outcome margin, but the contact rule itself is
+the capacity-constrained ranking by posterior expected incremental
+profit. Decision and evaluation tables are written to
+<code>outputs/</code> (<code>decisions_arpas.csv</code>,
+<code>decisions_arpas_detailed.csv</code>,
+<code>heldout_policy_values.csv</code>,
+<code>capacity_profit_curve.csv</code>).</p>
+<p>Natural extensions include nonparametric Bayesian CATE (e.g. BART),
+doubly robust (AIPW) policy-value intervals, and explicit utility over
+the full posterior knapsack.</p>
 </div>
 
 
