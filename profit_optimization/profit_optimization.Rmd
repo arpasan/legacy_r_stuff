@@ -49,7 +49,7 @@ data_dir <- "data"
 contact_cost <- 5
 clv_gain <- 100
 capacity_frac <- 0.25
-# Single assignment-style deliverable (Decisions.csv format): one column, N rows.
+# Single recommendation file: one `decision` column, N rows (CustomerBase order).
 decisions_path <- "decisions_recommended.csv"
 
 # Pastel palette for hatched bars / posterior curves.
@@ -57,39 +57,54 @@ col_pastel_blue <- "#8eb6c8"
 col_pastel_terra <- "#d4a08c"
 col_pastel_slate <- "#9aa7b2"
 
-# Thin unfilled bars with stripe hatch; outline matches pattern colour.
-hatched_col <- function(width, colour) {
+# Unfilled bars with thin stripe hatch (outline + hatch share `colour`).
+hatched_col <- function(
+    width,
+    colour,
+    linewidth = 0.25,
+    pattern_linewidth = 0.2,
+    pattern_spacing = 0.035,
+    pattern_density = 0.35
+) {
   geom_col_pattern(
     width = width,
     fill = NA,
     colour = colour,
-    linewidth = 0.55,
+    linewidth = linewidth,
     pattern = "stripe",
     pattern_angle = 45,
     pattern_colour = colour,
     pattern_fill = NA,
-    pattern_density = 0.45,
-    pattern_spacing = 0.025,
-    pattern_key_scale_factor = 0.6
+    pattern_density = pattern_density,
+    pattern_spacing = pattern_spacing,
+    pattern_linewidth = pattern_linewidth,
+    pattern_key_scale_factor = 0.5
   )
 }
 
-plot_theme_bars <- function(base_size = 11) {
+plot_theme_bars <- function(base_size = 10, axis_text_size = 8) {
   theme_minimal(base_size = base_size) +
     theme(
       panel.grid.minor = element_blank(),
       panel.grid.major.y = element_blank(),
-      axis.text.y = element_text(size = 10),
+      axis.text.x = element_text(size = axis_text_size),
+      axis.text.y = element_text(size = axis_text_size),
+      axis.title = element_text(size = axis_text_size + 1),
       plot.margin = margin(8, 12, 8, 8)
     )
 }
 
-# Half the previous importance bar width (was 0.55).
 plot_importance <- function(imp_tbl, colour = col_pastel_blue) {
   ggplot(imp_tbl, aes(x = importance, y = reorder(variable, importance))) +
-    hatched_col(width = 0.275, colour = colour) +
+    hatched_col(
+      width = 0.14,
+      colour = colour,
+      linewidth = 0.22,
+      pattern_linewidth = 0.18,
+      pattern_spacing = 0.04
+    ) +
     labs(x = "Importance", y = NULL) +
-    plot_theme_bars(base_size = 12)
+    plot_theme_bars(base_size = 10, axis_text_size = 7.5)
 }
 
 # Posterior expected incremental profit and P(EV > 0) from epred matrices.
@@ -140,9 +155,18 @@ $$
 
 Under a hard capacity $\sum_i d_i \le \lfloor N/4\rfloor$, the Bayes-optimal rule (linear utility, known costs) ranks customers by posterior expected $\mathrm{EV}(x)$ and contacts the highest-scoring clients, never exceeding capacity and never contacting a client whose posterior mean $\mathrm{EV}$ is negative.
 
-Purchase prediction at a fixed 0.5 threshold is a natural baseline, but the operational objective is expected incremental profit under that capacity constraint. The analysis therefore fits ensemble classifiers on the treated pilot arm, then centers the recommendation on a **joint Bayesian logistic S-learner with treatment interactions**, with held-out **IPW policy-value** checks and a Bayesian T-learner sensitivity comparison. The required output is a single binary recommendation per row of `CustomerBase.csv` (same format as the provided `decisions.csv` template).
+Purchase prediction at a fixed 0.5 threshold is a natural baseline, but the operational objective is expected incremental profit under that capacity constraint. The analysis therefore fits ensemble classifiers on the treated pilot arm, then centers the recommendation on a **joint Bayesian logistic S-learner with treatment interactions**, with held-out **IPW policy-value** checks and a Bayesian T-learner sensitivity comparison. The recommendation is a single binary `decision` per row of the customer base (row order preserved), written to `decisions_recommended.csv`.
 
 ## Data
+
+Two input tables ship in `data/` (original challenge filenames preserved):
+
+| File | Role |
+|------|------|
+| `pilot.csv` | Randomized contact experiment: features $V_1$–$V_{20}$, `treatment`, `purchase` |
+| `CustomerBase.csv` | Full client list to score: features $V_1$–$V_{20}$ only |
+
+The output recommendation is `decisions_recommended.csv` at the project root (one column, `decision` ∈ $\{0,1\}$, one row per `CustomerBase.csv` row).
 
 ```{r load-data}
 pilot <- readr::read_csv(file.path(data_dir, "pilot.csv"), show_col_types = FALSE) |>
@@ -585,7 +609,14 @@ tibble(
 ```{r s-vs-t-plot, fig.height=3.8}
 tibble(s = ev_eval$ev_mean, t_learner = ev_t$ev_mean) |>
   ggplot(aes(s, t_learner)) +
-  geom_point(alpha = 0.35, size = 1.2, colour = "#2b6a8f") +
+  geom_point(
+    shape = 21,
+    fill = NA,
+    colour = "#2b6a8f",
+    alpha = 0.55,
+    size = 1.35,
+    stroke = 0.35
+  ) +
   geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
   labs(
     x = "S-learner posterior mean EV",
@@ -656,16 +687,22 @@ knitr::kable(
 ```
 
 ```{r policy-plot, fig.height=3.4}
-# One-third the previous policy bar width (was 0.55).
 policy_tbl |>
   ggplot(aes(ipw_value, reorder(policy, ipw_value))) +
-  hatched_col(width = 0.18, colour = col_pastel_blue) +
+  hatched_col(
+    width = 0.07,
+    colour = col_pastel_blue,
+    linewidth = 0.18,
+    pattern_linewidth = 0.12,
+    pattern_spacing = 0.045,
+    pattern_density = 0.3
+  ) +
   labs(
     x = "IPW estimate of E[Y under policy] on held-out pilot",
     y = NULL,
     title = "Policy value comparison (higher is better)"
   ) +
-  plot_theme_bars(base_size = 11)
+  plot_theme_bars(base_size = 10, axis_text_size = 8)
 ```
 
 # Capacity–profit curve
@@ -920,10 +957,20 @@ dec_final |>
   theme(panel.grid.minor = element_blank(), legend.position = "bottom")
 
 col_ppos <- "#2ec4b6"
-dec_final |>
-  filter(decision == 1) |>
-  ggplot(aes(p_positive_ev)) +
-  geom_density(fill = alpha(col_ppos, 0.35), colour = NA, linewidth = 0) +
+ppos_dens <- density(dec_final$p_positive_ev[dec_final$decision == 1], from = 0, to = 1, n = 512)
+ppos_df <- tibble(x = ppos_dens$x, y = ppos_dens$y)
+ggplot(ppos_df, aes(x, y)) +
+  geom_area_pattern(
+    pattern = "stripe",
+    fill = NA,
+    colour = NA,
+    pattern_fill = NA,
+    pattern_colour = col_ppos,
+    pattern_angle = 45,
+    pattern_density = 0.4,
+    pattern_spacing = 0.03,
+    pattern_linewidth = 0.35
+  ) +
   labs(
     x = expression(P(EV > 0 ~ "|" ~ data)),
     y = "Density",
@@ -933,7 +980,7 @@ dec_final |>
   theme(panel.grid.minor = element_blank())
 ```
 
-The full length-$N$ recommendation vector (one `decision` column, same order as `CustomerBase.csv`) is written to `decisions_recommended.csv` for offline use. The template file `data/decisions.csv` illustrates that format only; it is not a scored answer key (its contact rate exceeds capacity).
+The full length-$N$ recommendation (column `decision`, same row order as `CustomerBase.csv`) is written to `decisions_recommended.csv`.
 
 ```{r write-decisions}
 readr::write_csv(dec_final |> select(decision), decisions_path)
