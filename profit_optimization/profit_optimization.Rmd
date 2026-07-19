@@ -57,18 +57,16 @@ col_pastel_blue <- "#8eb6c8"
 col_pastel_terra <- "#d4a08c"
 col_pastel_slate <- "#9aa7b2"
 
-# Unfilled bars with hairline stripe hatch.
+# Unfilled bars with stripe hatch.
 # ggpattern ignores `pattern_linewidth`; line weight is `pattern_size`.
-# On thin horizontal bars, 45° stripes clip into chunky dashes — use vertical
-# stripes (angle 90) so the hatch reads as fine lines along the bar.
 hatched_col <- function(
     width,
     colour,
-    linewidth = 0.2,
-    pattern_size = 0.04,
-    pattern_spacing = 0.03,
-    pattern_density = 0.4,
-    pattern_angle = 90
+    linewidth = 0.55,
+    pattern_size = 0.15,
+    pattern_spacing = 0.035,
+    pattern_density = 0.42,
+    pattern_angle = 45
 ) {
   geom_col_pattern(
     width = width,
@@ -82,11 +80,11 @@ hatched_col <- function(
     pattern_density = pattern_density,
     pattern_spacing = pattern_spacing,
     pattern_size = pattern_size,
-    pattern_key_scale_factor = 0.5
+    pattern_key_scale_factor = 0.55
   )
 }
 
-plot_theme_bars <- function(base_size = 10, axis_text_size = 8) {
+plot_theme_bars <- function(base_size = 11, axis_text_size = 9) {
   theme_minimal(base_size = base_size) +
     theme(
       panel.grid.minor = element_blank(),
@@ -100,15 +98,9 @@ plot_theme_bars <- function(base_size = 10, axis_text_size = 8) {
 
 plot_importance <- function(imp_tbl, colour = col_pastel_blue) {
   ggplot(imp_tbl, aes(x = importance, y = reorder(variable, importance))) +
-    hatched_col(
-      width = 0.14,
-      colour = colour,
-      linewidth = 0.18,
-      pattern_size = 0.035,
-      pattern_spacing = 0.028
-    ) +
+    hatched_col(width = 0.45, colour = colour) +
     labs(x = "Importance", y = NULL) +
-    plot_theme_bars(base_size = 10, axis_text_size = 7.5)
+    plot_theme_bars(base_size = 12, axis_text_size = 10)
 }
 
 # Posterior expected incremental profit and P(EV > 0) from epred matrices.
@@ -693,20 +685,13 @@ knitr::kable(
 ```{r policy-plot, fig.height=3.4}
 policy_tbl |>
   ggplot(aes(ipw_value, reorder(policy, ipw_value))) +
-  hatched_col(
-    width = 0.07,
-    colour = col_pastel_blue,
-    linewidth = 0.18,
-    pattern_size = 0.03,
-    pattern_spacing = 0.025,
-    pattern_density = 0.4
-  ) +
+  hatched_col(width = 0.5, colour = col_pastel_blue) +
   labs(
     x = "IPW estimate of E[Y under policy] on held-out pilot",
     y = NULL,
     title = "Policy value comparison (higher is better)"
   ) +
-  plot_theme_bars(base_size = 10, axis_text_size = 8)
+  plot_theme_bars(base_size = 11, axis_text_size = 9)
 ```
 
 # Capacity–profit curve
@@ -971,9 +956,9 @@ ggplot(ppos_df, aes(x, y)) +
     pattern_fill = NA,
     pattern_colour = col_ppos,
     pattern_angle = 45,
-    pattern_density = 0.28,
-    pattern_spacing = 0.014,
-    pattern_size = 0.015
+    pattern_density = 0.42,
+    pattern_spacing = 0.03,
+    pattern_size = 0.15
   ) +
   labs(
     x = expression(P(EV > 0 ~ "|" ~ data)),
