@@ -244,9 +244,9 @@ corrplot(
 )
 ```
 
-# Reconnaissance: classical ML (not the solution)
+# Baseline: supervised purchase classifiers
 
-```{r ml-recon}
+```{r ml-baseline}
 set.seed(42)
 e <- treated_train |>
   select(-treatment) |>
