@@ -8,3 +8,5 @@ AGENTS.md
 
 # Scratch outputs (the assignment deliverable is decisions_recommended.csv)
 **/outputs/
+*.rds
+**/header_nocache.html
