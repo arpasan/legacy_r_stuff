@@ -62,10 +62,10 @@ col_pastel_slate <- "#9aa7b2"
 hatched_col <- function(
     width,
     colour,
-    linewidth = 0.55,
-    pattern_size = 0.15,
-    pattern_spacing = 0.035,
-    pattern_density = 0.42,
+    linewidth = 0.5,
+    pattern_size = 0.11,
+    pattern_spacing = 0.01,
+    pattern_density = 0.6,
     pattern_angle = 45
 ) {
   geom_col_pattern(
@@ -98,7 +98,7 @@ plot_theme_bars <- function(base_size = 11, axis_text_size = 9) {
 
 plot_importance <- function(imp_tbl, colour = col_pastel_blue) {
   ggplot(imp_tbl, aes(x = importance, y = reorder(variable, importance))) +
-    hatched_col(width = 0.45, colour = colour) +
+    hatched_col(width = 0.3, colour = colour) +
     labs(x = "Importance", y = NULL) +
     plot_theme_bars(base_size = 12, axis_text_size = 10)
 }
@@ -685,7 +685,7 @@ knitr::kable(
 ```{r policy-plot, fig.height=3.4}
 policy_tbl |>
   ggplot(aes(ipw_value, reorder(policy, ipw_value))) +
-  hatched_col(width = 0.5, colour = col_pastel_blue) +
+  hatched_col(width = 0.28, colour = col_pastel_blue) +
   labs(
     x = "IPW estimate of E[Y under policy] on held-out pilot",
     y = NULL,
@@ -956,9 +956,9 @@ ggplot(ppos_df, aes(x, y)) +
     pattern_fill = NA,
     pattern_colour = col_ppos,
     pattern_angle = 45,
-    pattern_density = 0.42,
-    pattern_spacing = 0.03,
-    pattern_size = 0.15
+    pattern_density = 0.6,
+    pattern_spacing = 0.01,
+    pattern_size = 0.11
   ) +
   labs(
     x = expression(P(EV > 0 ~ "|" ~ data)),
