@@ -52,20 +52,22 @@ capacity_frac <- 0.25
 # Single recommendation file: one `decision` column, N rows (CustomerBase order).
 decisions_path <- "decisions_recommended.csv"
 
-# Pastel palette for hatched bars / posterior curves.
-col_pastel_blue <- "#8eb6c8"
+# Distinct pastels for the three hatched bar charts (RF / boost / policy).
 col_pastel_terra <- "#d4a08c"
-col_pastel_slate <- "#9aa7b2"
+col_pastel_blue <- "#8eb6c8"
+col_pastel_sage <- "#9bb59b"
+# Density / curve accent (mako-like teal, same family as the fraud holdout KDE).
+col_density <- "#2a6f7f"
 
-# Unfilled bars with stripe hatch.
-# ggpattern ignores `pattern_linewidth`; line weight is `pattern_size`.
+# Even diagonal hash (filled + stroked thin stripes at uniform spacing).
+# Empty stroked stripes (`pattern_fill = NA`) read as //-gap-// pairs.
 hatched_col <- function(
     width,
     colour,
-    linewidth = 0.28,
-    pattern_size = 0.11,
-    pattern_spacing = 0.01,
-    pattern_density = 0.6,
+    linewidth = 0.45,
+    pattern_spacing = 0.025,
+    pattern_density = 0.15,
+    pattern_size = 0.01,
     pattern_angle = 45
 ) {
   geom_col_pattern(
@@ -76,7 +78,8 @@ hatched_col <- function(
     pattern = "stripe",
     pattern_angle = pattern_angle,
     pattern_colour = colour,
-    pattern_fill = NA,
+    pattern_fill = colour,
+    pattern_alpha = 1,
     pattern_density = pattern_density,
     pattern_spacing = pattern_spacing,
     pattern_size = pattern_size,
@@ -204,36 +207,7 @@ pilot |>
     purchase_rate = mean(purchase),
     .groups = "drop"
   )
-
-# Covariate balance (standardized mean differences), as a randomization check.
-num_x <- pilot |>
-  select(where(is.numeric), -treatment, -purchase) |>
-  names()
-
-balance <- map_dfr(num_x, function(v) {
-  x1 <- pilot[[v]][pilot$treatment == 1]
-  x0 <- pilot[[v]][pilot$treatment == 0]
-  m1 <- mean(x1, na.rm = TRUE)
-  m0 <- mean(x0, na.rm = TRUE)
-  s <- sd(pilot[[v]], na.rm = TRUE)
-  tibble(variable = v, smd = (m1 - m0) / s)
-})
-
-balance |>
-  ggplot(aes(smd, reorder(variable, smd))) +
-  geom_col(width = 0.55, fill = "#4a4a4a", colour = NA) +
-  geom_vline(xintercept = 0, colour = "grey40") +
-  geom_vline(xintercept = c(-0.1, 0.1), linetype = "dashed", colour = "grey60") +
-  labs(
-    x = "Standardized mean difference (treated − control)",
-    y = NULL,
-    title = "Covariate balance in the randomized pilot"
-  ) +
-  theme_minimal(base_size = 11) +
-  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank())
 ```
-
-Balance SMDs near zero support treating the pilot as a credible RCT for identifying $\tau(x)$.
 
 ```{r split-pilot}
 set.seed(42)
@@ -685,7 +659,7 @@ knitr::kable(
 ```{r policy-plot, fig.height=3.4}
 policy_tbl |>
   ggplot(aes(ipw_value, reorder(policy, ipw_value))) +
-  hatched_col(width = 0.18, colour = col_pastel_blue) +
+  hatched_col(width = 0.18, colour = col_pastel_sage) +
   labs(
     x = "IPW estimate of E[Y under policy] on held-out pilot",
     y = NULL,
@@ -945,7 +919,6 @@ dec_final |>
   theme_minimal(base_size = 11) +
   theme(panel.grid.minor = element_blank(), legend.position = "bottom")
 
-col_ppos <- "black"
 ppos_dens <- density(dec_final$p_positive_ev[dec_final$decision == 1], from = 0, to = 1, n = 512)
 ppos_df <- tibble(x = ppos_dens$x, y = ppos_dens$y)
 ggplot(ppos_df, aes(x, y)) +
@@ -953,20 +926,27 @@ ggplot(ppos_df, aes(x, y)) +
     pattern = "stripe",
     fill = NA,
     colour = NA,
-    pattern_fill = NA,
-    pattern_colour = col_ppos,
+    pattern_fill = col_density,
+    pattern_colour = NA,
     pattern_angle = 45,
-    pattern_density = 0.6,
-    pattern_spacing = 0.01,
-    pattern_size = 0.11
+    pattern_density = 0.22,
+    pattern_spacing = 0.028,
+    pattern_alpha = 0.4
   ) +
+  geom_line(colour = col_density, linewidth = 1.1) +
+  coord_cartesian(xlim = c(0, 1)) +
   labs(
     x = expression(P(EV > 0 ~ "|" ~ data)),
-    y = "Density",
+    y = "density",
     title = "P(EV > 0) among contacted customers"
   ) +
-  theme_minimal(base_size = 11) +
-  theme(panel.grid.minor = element_blank())
+  theme_classic(base_size = 11, base_family = "mono") +
+  theme(
+    plot.title = element_text(size = 13),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10),
+    panel.grid = element_blank()
+  )
 ```
 
 The full length-$N$ recommendation (column `decision`, same row order as `CustomerBase.csv`) is written to `decisions_recommended.csv`.
